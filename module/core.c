@@ -631,6 +631,22 @@ void blur24_core(PyObject *pysrc,
  * with a sample size of twice the radius plus one. It can operate in
  * both the x and y axes.
  */
+/*
+ * Division by a blur's kernel size. The Vita's Cortex-A9 has no integer
+ * divide instruction, so each `/` was a ~100-cycle library call, four per
+ * pixel per pass (a 195x110 im.Blur took 83 ms). n * ceil(2^32 / d) >> 32
+ * equals n / d for 0 <= n while n * d < 2^32; blur sums are at most 255 * d,
+ * so it is exact for d < 4096. Larger kernels divide.
+ */
+static inline unsigned char blur_divide(int n, int d, unsigned long long m) {
+    if (m) {
+        return (unsigned char) (((unsigned long long) (unsigned int) n * m) >> 32);
+    }
+    return (unsigned char) (n / d);
+}
+
+#define BLUR_RECIPROCAL(d) ((d) < 4096 ? (0x100000000ULL + (d) - 1) / (d) : 0ULL)
+
 void linblur32_core(PyObject *pysrc,
                     PyObject *pydst,
                     int radius,
@@ -670,6 +686,7 @@ void linblur32_core(PyObject *pysrc,
     }
 
     int divisor = radius * 2 + 1;
+    unsigned long long reciprocal = BLUR_RECIPROCAL(divisor);
 
     for (r = 0; r < rows; r++) {
         // The values of the pixels on the left and right ends of the
@@ -707,10 +724,10 @@ void linblur32_core(PyObject *pysrc,
             suma += *leader++;
             leader += incr;
 
-            *dstp++ = sumr / divisor;
-            *dstp++ = sumg / divisor;
-            *dstp++ = sumb / divisor;
-            *dstp++ = suma / divisor;
+            *dstp++ = blur_divide(sumr, divisor, reciprocal);
+            *dstp++ = blur_divide(sumg, divisor, reciprocal);
+            *dstp++ = blur_divide(sumb, divisor, reciprocal);
+            *dstp++ = blur_divide(suma, divisor, reciprocal);
             dstp += incr;
 
             sumr -= lr;
@@ -729,10 +746,10 @@ void linblur32_core(PyObject *pysrc,
             suma += *leader++;
             leader += incr;
 
-            *dstp++ = sumr / divisor;
-            *dstp++ = sumg / divisor;
-            *dstp++ = sumb / divisor;
-            *dstp++ = suma / divisor;
+            *dstp++ = blur_divide(sumr, divisor, reciprocal);
+            *dstp++ = blur_divide(sumg, divisor, reciprocal);
+            *dstp++ = blur_divide(sumb, divisor, reciprocal);
+            *dstp++ = blur_divide(suma, divisor, reciprocal);
             dstp += incr;
 
             sumr -= *trailer++;
@@ -754,10 +771,10 @@ void linblur32_core(PyObject *pysrc,
             sumb += rb;
             suma += ra;
 
-            *dstp++ = sumr / divisor;
-            *dstp++ = sumg / divisor;
-            *dstp++ = sumb / divisor;
-            *dstp++ = suma / divisor;
+            *dstp++ = blur_divide(sumr, divisor, reciprocal);
+            *dstp++ = blur_divide(sumg, divisor, reciprocal);
+            *dstp++ = blur_divide(sumb, divisor, reciprocal);
+            *dstp++ = blur_divide(suma, divisor, reciprocal);
             dstp += incr;
 
             sumr -= *trailer++;
@@ -810,6 +827,7 @@ void linblur24_core(PyObject *pysrc,
     }
 
     int divisor = radius * 2 + 1;
+    unsigned long long reciprocal = BLUR_RECIPROCAL(divisor);
 
     for (r = 0; r < rows; r++) {
         // The values of the pixels on the left and right ends of the
@@ -843,9 +861,9 @@ void linblur24_core(PyObject *pysrc,
             sumb += *leader++;
             leader += incr;
 
-            *dstp++ = sumr / divisor;
-            *dstp++ = sumg / divisor;
-            *dstp++ = sumb / divisor;
+            *dstp++ = blur_divide(sumr, divisor, reciprocal);
+            *dstp++ = blur_divide(sumg, divisor, reciprocal);
+            *dstp++ = blur_divide(sumb, divisor, reciprocal);
             dstp += incr;
 
             sumr -= lr;
@@ -862,9 +880,9 @@ void linblur24_core(PyObject *pysrc,
             sumb += *leader++;
             leader += incr;
 
-            *dstp++ = sumr / divisor;
-            *dstp++ = sumg / divisor;
-            *dstp++ = sumb / divisor;
+            *dstp++ = blur_divide(sumr, divisor, reciprocal);
+            *dstp++ = blur_divide(sumg, divisor, reciprocal);
+            *dstp++ = blur_divide(sumb, divisor, reciprocal);
             dstp += incr;
 
             sumr -= *trailer++;
@@ -883,9 +901,9 @@ void linblur24_core(PyObject *pysrc,
             sumg += rg;
             sumb += rb;
 
-            *dstp++ = sumr / divisor;
-            *dstp++ = sumg / divisor;
-            *dstp++ = sumb / divisor;
+            *dstp++ = blur_divide(sumr, divisor, reciprocal);
+            *dstp++ = blur_divide(sumg, divisor, reciprocal);
+            *dstp++ = blur_divide(sumb, divisor, reciprocal);
             dstp += incr;
 
             sumr -= *trailer++;
