@@ -18,6 +18,7 @@
 #include <EGL/eglext.h>
 #include <GLES2/gl2.h>
 #include <GLES2/gl2ext.h>
+#include "vita_pixmap.h"
 
 /* Services types, as laid out in PVR_PSP2's services.h. */
 typedef struct {
@@ -89,22 +90,18 @@ static int init_services(char *msg, size_t len) {
     return 0;
 }
 
-/*
- * Creates a width x height 32-bit pixmap, an EGL image of it and a GL
- * texture bound to that image. Returns (texture, address of the pixels,
- * message); texture is 0 on failure.
- */
-PyObject *RPVITA_pixmap_texture(int width, int height) {
-    char msg[256] = "ok";
+int vita_pixmap_create(int width, int height, int nearest, VitaPixmap *out, char *msg, size_t len) {
     Psp2NativePixmap *pixmap;
     EGLImageKHR image;
     GLuint texture = 0;
+    GLint filter = nearest ? GL_NEAREST : GL_LINEAR;
     GLenum error;
 
-    if (init_services(msg, sizeof(msg))) {
-        return Py_BuildValue("(iks)", 0, 0UL, msg);
+    if (init_services(msg, len)) {
+        return -1;
     }
 
+    /* Freed never: EGL keeps the pointer as the image's drawable. */
     pixmap = (Psp2NativePixmap *) calloc(1, sizeof(Psp2NativePixmap));
     pixmap->type = PSP2_DRAWABLE_TYPE_PIXMAP;
     pixmap->sizeX = width;
@@ -116,25 +113,48 @@ PyObject *RPVITA_pixmap_texture(int width, int height) {
     image = create_image(eglGetCurrentDisplay(), EGL_NO_CONTEXT, EGL_NATIVE_PIXMAP_KHR, (EGLClientBuffer) pixmap, NULL);
 
     if (image == EGL_NO_IMAGE_KHR) {
-        snprintf(msg, sizeof(msg), "eglCreateImageKHR failed: 0x%x", eglGetError());
+        snprintf(msg, len, "eglCreateImageKHR failed: 0x%x", eglGetError());
         free(pixmap);
-        return Py_BuildValue("(iks)", 0, 0UL, msg);
+        return -1;
     }
 
     glGenTextures(1, &texture);
     glBindTexture(GL_TEXTURE_2D, texture);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filter);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filter);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, (GLeglImageOES) image);
 
     error = glGetError();
     if (error) {
-        snprintf(msg, sizeof(msg), "glEGLImageTargetTexture2DOES error 0x%x (memBase %p)", error, pixmap->memBase);
+        snprintf(msg, len, "glEGLImageTargetTexture2DOES error 0x%x", error);
+        return -1;
     }
 
-    return Py_BuildValue("(iks)", (int) texture, (unsigned long) pixmap->memBase, msg);
+    out->base = (unsigned char *) pixmap->memBase;
+    /* As WSEGL_CreatePixmapDrawable sizes CDRAM pixmaps. */
+    out->size = ((unsigned int) width * height * 4 + 256 * 1024 - 1) & ~(256 * 1024 - 1);
+    out->texture = texture;
+    out->width = width;
+    out->height = height;
+
+    return 0;
+}
+
+/*
+ * Test helper: creates a width x height pixmap texture. Returns (texture,
+ * address of the pixels, message); texture is 0 on failure.
+ */
+PyObject *RPVITA_pixmap_texture(int width, int height) {
+    char msg[256] = "ok";
+    VitaPixmap pixmap;
+
+    if (vita_pixmap_create(width, height, 0, &pixmap, msg, sizeof(msg))) {
+        return Py_BuildValue("(iks)", 0, 0UL, msg);
+    }
+
+    return Py_BuildValue("(iks)", (int) pixmap.texture, (unsigned long) pixmap.base, msg);
 }
 
 /* Test pattern: bands of red, green, blue and white, shifted by phase. */

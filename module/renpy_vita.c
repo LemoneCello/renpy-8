@@ -9,6 +9,8 @@
 #include "psp2/audioout.h"
 #include <pygame_sdl2/pygame_sdl2.h>
 #include <libswscale/swscale.h>
+#include <GLES2/gl2.h>
+#include "vita_pixmap.h"
 
 #define FRAMEBUFFER_ALIGNMENT 0x40000
 
@@ -41,6 +43,36 @@ SceAvPlayerHandle movie_player;
 int player_state = PLAYER_INACTIVE;
 static SDL_mutex *frame_mutex;
 static int audio_port = -1;
+
+/*
+ * Zero-copy video: AvPlayer decodes into GPU-shared pixmap memory (frame
+ * pool, handed out by gpu_alloc), and video_read_texture converts the
+ * current NV12 frame to RGB with a shader into one texture, all on the GPU.
+ * Off unless video_set_zero_copy(1); otherwise frames are converted on the
+ * CPU and returned as surfaces (read_video).
+ */
+#define FRAME_POOL_SIZE 4
+#define FRAME_POOL_TEXELS_X 256
+#define FRAME_POOL_TEXELS_Y 2048
+
+static VitaPixmap frame_pool[FRAME_POOL_SIZE];
+static int frame_pool_used[FRAME_POOL_SIZE];
+static int frame_pool_state = 0;  /* 0 not made yet, 1 ready, -1 failed */
+static int zero_copy_wanted = 0;
+static int zero_copy = 0;         /* this movie decodes into the pool */
+static char zero_copy_msg[256] = "";
+static uint64_t last_zero_copy_ts = (uint64_t) -1;
+static int zero_copy_frames = 0;
+static int zero_copy_misses = 0;
+
+#define ALLOC_LOG_SIZE 16
+static struct {
+    uint32_t alignment;
+    uint32_t size;
+    void *ptr;
+    int pool;
+} alloc_log[ALLOC_LOG_SIZE];
+static int alloc_log_count = 0;
 
 void movie_audio_init() {
     audio_port = sceAudioOutOpenPort(SCE_AUDIO_OUT_PORT_TYPE_BGM, 1024, 48000, SCE_AUDIO_OUT_PARAM_FORMAT_S16_STEREO);
@@ -113,6 +145,27 @@ int fetch_frame_thread() {
     return 0;
 }
 
+// Zero-copy movies: frames are fetched on the main thread
+// (video_read_texture); this only notices the end of the movie and closes
+// the player, as fetch_frame_thread does.
+int monitor_thread() {
+    while (player_state == PLAYER_ACTIVE) {
+        if (!sceAvPlayerIsActive(movie_player)) {
+            player_state = PLAYER_STOP;
+            break;
+        }
+        sceKernelDelayThread(10000);
+    }
+
+    if (player_state == PLAYER_STOP) {
+        sceAvPlayerStop(movie_player);
+        sceAvPlayerClose(movie_player);
+        player_state = PLAYER_INACTIVE;
+        received_frames = 0;
+    }
+    return 0;
+}
+
 PyObject *RPVITA_video_read_video() {
     SDL_Surface *surf = NULL;
 
@@ -170,6 +223,19 @@ void RPVITA_video_start(const char *file) {
     SceAvPlayerInitData playerInit;
     memset(&playerInit, 0, sizeof(SceAvPlayerInitData));
 
+    if (zero_copy_wanted && frame_pool_state == 0) {
+        frame_pool_state = 1;
+        for (int i = 0; i < FRAME_POOL_SIZE; i++) {
+            if (vita_pixmap_create(FRAME_POOL_TEXELS_X, FRAME_POOL_TEXELS_Y, 1, &frame_pool[i], zero_copy_msg, sizeof(zero_copy_msg))) {
+                frame_pool_state = -1;
+                break;
+            }
+        }
+    }
+
+    zero_copy = zero_copy_wanted && frame_pool_state == 1;
+    last_zero_copy_ts = (uint64_t) -1;
+
     playerInit.memoryReplacement.allocate = mem_alloc;
     playerInit.memoryReplacement.deallocate = mem_free;
     playerInit.memoryReplacement.allocateTexture = gpu_alloc;
@@ -177,7 +243,7 @@ void RPVITA_video_start(const char *file) {
     playerInit.eventReplacement.eventCallback = event_callback;
 
     playerInit.basePriority = 0xA0;
-    playerInit.numOutputVideoFrameBuffers = 2;
+    playerInit.numOutputVideoFrameBuffers = zero_copy ? 3 : 2;
     playerInit.autoStart = 0;
 
     movie_player = sceAvPlayerInit(&playerInit);
@@ -228,7 +294,11 @@ static void event_callback(void *p, int32_t argEventId, int32_t argSourceId, voi
         printf("Video ts: %ld\n", sceAvPlayerCurrentTime(movie_player));
         printf("Start video\n");
         sceAvPlayerStart(movie_player);
-        SDL_CreateThread(fetch_frame_thread, "Video fetch frame", NULL);
+        if (zero_copy) {
+            SDL_CreateThread(monitor_thread, "Video monitor", NULL);
+        } else {
+            SDL_CreateThread(fetch_frame_thread, "Video fetch frame", NULL);
+        }
         SDL_CreateThread(movie_audio_thread, "Movie audio thread", NULL);
     }
 }
@@ -284,6 +354,22 @@ static void mem_free(void *p, void* pMemory) {
 static void *gpu_alloc(void *p, uint32_t alignment, uint32_t size) {
     void *res = NULL;
 
+    if (zero_copy) {
+        for (int i = 0; i < FRAME_POOL_SIZE; i++) {
+            if (!frame_pool_used[i] && size <= frame_pool[i].size) {
+                frame_pool_used[i] = 1;
+                if (alloc_log_count < ALLOC_LOG_SIZE) {
+                    alloc_log[alloc_log_count].alignment = alignment;
+                    alloc_log[alloc_log_count].size = size;
+                    alloc_log[alloc_log_count].ptr = frame_pool[i].base;
+                    alloc_log[alloc_log_count].pool = i;
+                    alloc_log_count++;
+                }
+                return frame_pool[i].base;
+            }
+        }
+    }
+
     if (alignment < FRAMEBUFFER_ALIGNMENT)
         alignment = FRAMEBUFFER_ALIGNMENT;
 
@@ -296,11 +382,261 @@ static void *gpu_alloc(void *p, uint32_t alignment, uint32_t size) {
     SceUID memblock = sceKernelAllocMemBlock("Video Memblock", SCE_KERNEL_MEMBLOCK_TYPE_USER_CDRAM_RW, size, &opt);
     sceKernelGetMemBlockBase(memblock, &res);
     sceGxmMapMemory(res, size, (SceGxmMemoryAttribFlags)(SCE_GXM_MEMORY_ATTRIB_READ | SCE_GXM_MEMORY_ATTRIB_WRITE));
+
+    if (alloc_log_count < ALLOC_LOG_SIZE) {
+        alloc_log[alloc_log_count].alignment = alignment;
+        alloc_log[alloc_log_count].size = size;
+        alloc_log[alloc_log_count].ptr = res;
+        alloc_log[alloc_log_count].pool = -1;
+        alloc_log_count++;
+    }
+
     return res;
 }
 
 static void gpu_free(void *p, void *ptr) {
+    for (int i = 0; i < FRAME_POOL_SIZE; i++) {
+        if (frame_pool_state == 1 && ptr == frame_pool[i].base) {
+            frame_pool_used[i] = 0;
+            return;
+        }
+    }
+
     SceUID memblock = sceKernelFindMemBlockByAddr(ptr, 0);
     sceGxmUnmapMemory(ptr);
     sceKernelFreeMemBlock(memblock);
+}
+
+
+/* Zero-copy conversion ---------------------------------------------------- */
+
+static const char *zc_vertex_shader =
+    "attribute vec2 a_position;\n"
+    "void main() { gl_Position = vec4(a_position, 0.0, 1.0); }\n";
+
+/* Reads NV12 bytes out of a pool pixmap (4 bytes per texel, B G R A order
+ * in memory) and converts them to RGB (BT.601, limited range). Output pixel
+ * (x, y) is video pixel (x, y), so texture row 0 is the top of the frame. */
+static const char *zc_fragment_shader =
+    "precision highp float;\n"
+    "uniform sampler2D u_pool;\n"
+    "uniform vec2 u_pool_size;\n"
+    "uniform float u_y_offset;\n"
+    "uniform float u_uv_offset;\n"
+    "uniform float u_stride;\n"
+    "float byte_at(float address) {\n"
+    "    float texel = floor(address / 4.0);\n"
+    "    float component = address - texel * 4.0;\n"
+    "    float tx = mod(texel, u_pool_size.x);\n"
+    "    float ty = floor(texel / u_pool_size.x);\n"
+    "    vec4 t = texture2D(u_pool, (vec2(tx, ty) + 0.5) / u_pool_size);\n"
+    "    return dot(t, vec4(equal(vec4(component), vec4(2.0, 1.0, 0.0, 3.0))));\n"
+    "}\n"
+    "void main() {\n"
+    "    vec2 p = floor(gl_FragCoord.xy);\n"
+    "    float y = (byte_at(u_y_offset + p.y * u_stride + p.x) - 0.0625) * 1.164;\n"
+    "    float uv = u_uv_offset + floor(p.y / 2.0) * u_stride + floor(p.x / 2.0) * 2.0;\n"
+    "    float u = byte_at(uv) - 0.5;\n"
+    "    float v = byte_at(uv + 1.0) - 0.5;\n"
+    "    gl_FragColor = vec4(y + 1.596 * v, y - 0.391 * u - 0.813 * v, y + 2.018 * u, 1.0);\n"
+    "}\n";
+
+static GLuint zc_program = 0;
+static GLint zc_u_pool, zc_u_pool_size, zc_u_y_offset, zc_u_uv_offset, zc_u_stride;
+static GLuint zc_fbo = 0;
+static GLuint zc_target = 0;
+static int zc_target_width = 0;
+static int zc_target_height = 0;
+
+static GLuint zc_compile(GLenum kind, const char *source) {
+    GLuint shader = glCreateShader(kind);
+    GLint ok = 0;
+    glShaderSource(shader, 1, &source, NULL);
+    glCompileShader(shader);
+    glGetShaderiv(shader, GL_COMPILE_STATUS, &ok);
+    if (!ok) {
+        char log[200] = "";
+        glGetShaderInfoLog(shader, sizeof(log), NULL, log);
+        snprintf(zero_copy_msg, sizeof(zero_copy_msg), "shader compile failed: %s", log);
+        return 0;
+    }
+    return shader;
+}
+
+static int zc_setup(int width, int height) {
+    GLint ok = 0;
+
+    if (!zc_program) {
+        GLuint vs = zc_compile(GL_VERTEX_SHADER, zc_vertex_shader);
+        GLuint fs = zc_compile(GL_FRAGMENT_SHADER, zc_fragment_shader);
+        if (!vs || !fs) {
+            return -1;
+        }
+        zc_program = glCreateProgram();
+        glAttachShader(zc_program, vs);
+        glAttachShader(zc_program, fs);
+        glBindAttribLocation(zc_program, 0, "a_position");
+        glLinkProgram(zc_program);
+        glGetProgramiv(zc_program, GL_LINK_STATUS, &ok);
+        if (!ok) {
+            snprintf(zero_copy_msg, sizeof(zero_copy_msg), "shader link failed");
+            glDeleteProgram(zc_program);
+            zc_program = 0;
+            return -1;
+        }
+        zc_u_pool = glGetUniformLocation(zc_program, "u_pool");
+        zc_u_pool_size = glGetUniformLocation(zc_program, "u_pool_size");
+        zc_u_y_offset = glGetUniformLocation(zc_program, "u_y_offset");
+        zc_u_uv_offset = glGetUniformLocation(zc_program, "u_uv_offset");
+        zc_u_stride = glGetUniformLocation(zc_program, "u_stride");
+        glGenFramebuffers(1, &zc_fbo);
+    }
+
+    if (zc_target_width != width || zc_target_height != height) {
+        GLint old_framebuffer = 0;
+
+        if (zc_target) {
+            glDeleteTextures(1, &zc_target);
+        }
+        glGenTextures(1, &zc_target);
+        glBindTexture(GL_TEXTURE_2D, zc_target);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+
+        glGetIntegerv(GL_FRAMEBUFFER_BINDING, &old_framebuffer);
+        glBindFramebuffer(GL_FRAMEBUFFER, zc_fbo);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, zc_target, 0);
+        GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+        glBindFramebuffer(GL_FRAMEBUFFER, old_framebuffer);
+
+        if (status != GL_FRAMEBUFFER_COMPLETE) {
+            snprintf(zero_copy_msg, sizeof(zero_copy_msg), "framebuffer status 0x%x", status);
+            return -1;
+        }
+
+        zc_target_width = width;
+        zc_target_height = height;
+    }
+
+    return 0;
+}
+
+/* Converts the frame at data (inside pool pixmap block) into zc_target,
+ * leaving the GL state as it found it. */
+static void zc_convert(VitaPixmap *block, uint8_t *data, int width, int height) {
+    static const GLfloat quad[] = { -1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f, 1.0f, 1.0f };
+
+    GLint program, framebuffer, viewport[4], array_buffer, active_texture, texture;
+    GLint attrib_enabled, attrib_size, attrib_type, attrib_normalized, attrib_stride, attrib_buffer;
+    GLvoid *attrib_pointer;
+    GLboolean blend = glIsEnabled(GL_BLEND);
+    GLboolean scissor = glIsEnabled(GL_SCISSOR_TEST);
+
+    glGetIntegerv(GL_CURRENT_PROGRAM, &program);
+    glGetIntegerv(GL_FRAMEBUFFER_BINDING, &framebuffer);
+    glGetIntegerv(GL_VIEWPORT, viewport);
+    glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &array_buffer);
+    glGetIntegerv(GL_ACTIVE_TEXTURE, &active_texture);
+    glActiveTexture(GL_TEXTURE0);
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &texture);
+    glGetVertexAttribiv(0, GL_VERTEX_ATTRIB_ARRAY_ENABLED, &attrib_enabled);
+    glGetVertexAttribiv(0, GL_VERTEX_ATTRIB_ARRAY_SIZE, &attrib_size);
+    glGetVertexAttribiv(0, GL_VERTEX_ATTRIB_ARRAY_TYPE, &attrib_type);
+    glGetVertexAttribiv(0, GL_VERTEX_ATTRIB_ARRAY_NORMALIZED, &attrib_normalized);
+    glGetVertexAttribiv(0, GL_VERTEX_ATTRIB_ARRAY_STRIDE, &attrib_stride);
+    glGetVertexAttribiv(0, GL_VERTEX_ATTRIB_ARRAY_BUFFER_BINDING, &attrib_buffer);
+    glGetVertexAttribPointerv(0, GL_VERTEX_ATTRIB_ARRAY_POINTER, &attrib_pointer);
+
+    glBindFramebuffer(GL_FRAMEBUFFER, zc_fbo);
+    glViewport(0, 0, width, height);
+    glDisable(GL_BLEND);
+    glDisable(GL_SCISSOR_TEST);
+    glUseProgram(zc_program);
+    glBindTexture(GL_TEXTURE_2D, block->texture);
+    glUniform1i(zc_u_pool, 0);
+    glUniform2f(zc_u_pool_size, (float) block->width, (float) block->height);
+    glUniform1f(zc_u_y_offset, (float) (data - block->base));
+    glUniform1f(zc_u_uv_offset, (float) (data - block->base + width * height));
+    glUniform1f(zc_u_stride, (float) width);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, quad);
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+
+    glBindBuffer(GL_ARRAY_BUFFER, attrib_buffer);
+    glVertexAttribPointer(0, attrib_size, attrib_type, attrib_normalized, attrib_stride, attrib_pointer);
+    if (!attrib_enabled) {
+        glDisableVertexAttribArray(0);
+    }
+    glBindBuffer(GL_ARRAY_BUFFER, array_buffer);
+    glBindTexture(GL_TEXTURE_2D, texture);
+    glActiveTexture(active_texture);
+    glUseProgram(program);
+    if (blend) glEnable(GL_BLEND);
+    if (scissor) glEnable(GL_SCISSOR_TEST);
+    glViewport(viewport[0], viewport[1], viewport[2], viewport[3]);
+    glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
+}
+
+void RPVITA_video_set_zero_copy(int enabled) {
+    zero_copy_wanted = enabled;
+}
+
+/*
+ * Zero-copy movies: if a new frame is due, converts it and returns
+ * (texture, width, height); the same GL texture is reused for every frame.
+ * Returns None when there's no new frame (or zero-copy isn't in use).
+ */
+PyObject *RPVITA_video_read_texture() {
+    SceAvPlayerFrameInfo info;
+
+    if (!zero_copy || player_state != PLAYER_ACTIVE || !sceAvPlayerIsActive(movie_player)) {
+        Py_RETURN_NONE;
+    }
+
+    if (!sceAvPlayerGetVideoData(movie_player, &info) || info.timeStamp == last_zero_copy_ts) {
+        Py_RETURN_NONE;
+    }
+
+    int width = info.details.video.width;
+    int height = info.details.video.height;
+
+    VitaPixmap *block = NULL;
+    for (int i = 0; i < FRAME_POOL_SIZE; i++) {
+        if (info.pData >= frame_pool[i].base && info.pData + width * height * 3 / 2 <= frame_pool[i].base + frame_pool[i].size) {
+            block = &frame_pool[i];
+        }
+    }
+
+    if (!block) {
+        zero_copy_misses++;
+        Py_RETURN_NONE;
+    }
+
+    if (zc_setup(width, height)) {
+        Py_RETURN_NONE;
+    }
+
+    zc_convert(block, info.pData, width, height);
+    last_zero_copy_ts = info.timeStamp;
+    zero_copy_frames++;
+
+    return Py_BuildValue("(iii)", (int) zc_target, width, height);
+}
+
+/* Diagnostics: zero-copy state and AvPlayer's frame allocations. */
+PyObject *RPVITA_video_debug() {
+    PyObject *allocs = PyList_New(0);
+    for (int i = 0; i < alloc_log_count; i++) {
+        PyObject *t = Py_BuildValue("(IIki)", alloc_log[i].alignment, alloc_log[i].size, (unsigned long) alloc_log[i].ptr, alloc_log[i].pool);
+        PyList_Append(allocs, t);
+        Py_DECREF(t);
+    }
+    return Py_BuildValue("{s:i,s:i,s:i,s:i,s:s,s:N}",
+        "pool_state", frame_pool_state, "zero_copy", zero_copy,
+        "frames", zero_copy_frames, "misses", zero_copy_misses,
+        "msg", zero_copy_msg, "allocs", allocs);
 }
