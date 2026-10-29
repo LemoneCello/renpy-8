@@ -492,7 +492,10 @@ class Movie(renpy.display.displayable.Displayable):
 
         if channel == "movie" and play and renpy.config.single_movie_channel:
             channel = renpy.config.single_movie_channel
-        elif channel == "movie" and play and renpy.config.auto_movie_channel:
+        elif channel == "movie" and play and renpy.config.auto_movie_channel and not renpy.vita:
+            # (On the Vita only the "movie" channel can play video: it's the
+            # one VitaVideoChannel, backed by the single AvPlayer instance,
+            # so Movie images share it, as before auto_movie_channel.)
             channel = "_movie_{}".format(movie_channel_serial)
             movie_channel_serial += 1
 
