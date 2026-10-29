@@ -41,12 +41,16 @@ enum {
 
 /*
  * One per movie, passed to its threads and to AvPlayer's event callback, so
- * each works on its own player: when a movie ends, the next one usually
- * starts before the old threads have closed theirs. (Never freed; a few
- * bytes per movie.)
+ * each works on its own player. When a movie ends Ren'Py starts the next one
+ * at once, and AvPlayer crashes (in its controller thread) if a second player
+ * is set up while the first is still open, so video_start waits for the old
+ * one to be closed. (Never freed; a few bytes per movie.)
  */
 typedef struct {
     SceAvPlayerHandle handle;
+    volatile int threads_started;  /* set at READY */
+    volatile int audio_running;
+    volatile int closed;
 } MoviePlayer;
 
 static MoviePlayer *current_player = NULL;
@@ -127,8 +131,14 @@ static int player_current(MoviePlayer *mp) {
 // Closes a movie's player; resets the shared state if it's still the
 // current movie.
 static void close_player(MoviePlayer *mp) {
+    // The audio thread may be inside sceAvPlayerGetAudioData.
+    for (int i = 0; i < 100 && mp->audio_running; i++) {
+        sceKernelDelayThread(10000);
+    }
+
     sceAvPlayerStop(mp->handle);
     sceAvPlayerClose(mp->handle);
+    mp->closed = 1;
 
     SDL_LockMutex(frame_mutex);
     if (mp == current_player) {
@@ -238,6 +248,7 @@ int movie_audio_thread(void *data) {
         }
     }
 
+    mp->audio_running = 0;
     printf("Audio thread exit\n");
     return 0;
 }
@@ -245,6 +256,24 @@ int movie_audio_thread(void *data) {
 void RPVITA_video_start(const char *file) {
     SceAvPlayerInitData playerInit;
     memset(&playerInit, 0, sizeof(SceAvPlayerInitData));
+
+    // Stop the previous movie and wait until its player is closed.
+    MoviePlayer *old = current_player;
+
+    SDL_LockMutex(frame_mutex);
+    current_player = NULL;
+    player_state = PLAYER_STOP;
+    SDL_UnlockMutex(frame_mutex);
+
+    if (old && !old->closed) {
+        if (!old->threads_started) {
+            close_player(old);
+        } else {
+            for (int i = 0; i < 300 && !old->closed; i++) {
+                sceKernelDelayThread(10000);
+            }
+        }
+    }
 
     if (zero_copy_wanted && frame_pool_state == 0) {
         frame_pool_state = 1;
@@ -325,6 +354,8 @@ static void event_callback(void *p, int32_t argEventId, int32_t argSourceId, voi
         printf("Video ts: %ld\n", sceAvPlayerCurrentTime(mp->handle));
         printf("Start video\n");
         sceAvPlayerStart(mp->handle);
+        mp->threads_started = 1;
+        mp->audio_running = 1;
         if (zero_copy) {
             SDL_CreateThread(monitor_thread, "Video monitor", mp);
         } else {
