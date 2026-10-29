@@ -6,8 +6,7 @@
  * The driver's window system supports EGL images of native pixmaps
  * (Psp2NativePixmap, EGL_NATIVE_PIXMAP_KHR): it allocates the pixmap's memory
  * and maps it to the GPU with the device data and memory context the caller
- * supplies. Those come from the GPU services library (SceGpuEs4User, stub
- * generated from PVR_PSP2's SceGpuEs4User.emd), on a connection of our own.
+ * supplies (see init_services).
  */
 
 #include <Python.h>
@@ -26,77 +25,55 @@ typedef struct {
     void *hDevCookie;
 } VP_DEV_DATA;
 
-typedef struct {
-    int eDeviceType;
-    int eDeviceClass;
-    unsigned int ui32DeviceIndex;
-    char *pszPDumpDevName;
-    char *pszPDumpRegName;
-} VP_DEVICE_IDENTIFIER;
+void *sceKernelGetTLSAddr(int key);
 
-typedef struct {
-    unsigned char data[24];
-} VP_HEAP_INFO;
+/*
+ * PVRSRVConnect from the app fails (PVRSRV_ERROR_INVALID_PARAMS) once EGL is
+ * connected, so the pixmap uses EGL's own device data and memory context (the
+ * ones GLES textures are mapped with). Found by disassembling libIMGEGL.suprx
+ * (PVR_PSP2 v3.9): its per-thread data is in TLS slot 255, with a pointer to
+ * its global data at +48; the services context is at global + 0x3f8:
+ * connection at +0, PVRSRV_DEV_DATA at +4, device memory context at +0xc4.
+ */
+#define EGL_TLS_KEY 255
+#define EGL_TLS_GLOBAL 48
+#define EGL_GLOBAL_SYS_CONTEXT 0x3f8
+#define EGL_SYS_DEV_DATA 4
+#define EGL_SYS_DEV_MEM_CONTEXT 0xc4
 
-#define VP_MAX_DEVICES 16
-#define VP_MAX_CLIENT_HEAPS 32
-#define VP_DEVICE_CLASS_3D 0
-#define VP_DEVICE_TYPE_UNKNOWN 0
-
-int PVRSRVConnect(void **ppsConnection, unsigned int flags);
-int PVRSRVEnumerateDevices(void *psConnection, unsigned int *num, VP_DEVICE_IDENTIFIER *ids);
-int PVRSRVAcquireDeviceData(void *psConnection, unsigned int index, VP_DEV_DATA *dev, int type);
-int PVRSRVCreateDeviceMemContext(VP_DEV_DATA *dev, void **ctx, unsigned int *heap_count, VP_HEAP_INFO *heaps);
-
-static VP_DEV_DATA dev_data;
+static VP_DEV_DATA *dev_data = NULL;
 static void *dev_mem_context = NULL;
-static int services_ready = 0;
 
 static PFNEGLCREATEIMAGEKHRPROC create_image = NULL;
 
 static int init_services(char *msg, size_t len) {
-    void *connection = NULL;
-    unsigned int count = 0;
-    unsigned int heaps = 0;
-    VP_DEVICE_IDENTIFIER ids[VP_MAX_DEVICES];
-    VP_HEAP_INFO heap_info[VP_MAX_CLIENT_HEAPS];
-    int rv;
+    void **slot;
+    char *tls;
+    char *global;
+    char *sys;
 
-    if (services_ready) {
+    if (dev_data) {
         return 0;
     }
 
-    rv = PVRSRVConnect(&connection, 0);
-    if (rv) {
-        snprintf(msg, len, "PVRSRVConnect failed: %d", rv);
+    slot = (void **) sceKernelGetTLSAddr(EGL_TLS_KEY);
+    if (!slot || !*slot) {
+        snprintf(msg, len, "no EGL thread data (call from the GL thread)");
         return -1;
     }
 
-    rv = PVRSRVEnumerateDevices(connection, &count, ids);
-    if (rv) {
-        snprintf(msg, len, "PVRSRVEnumerateDevices failed: %d", rv);
+    tls = (char *) *slot;
+    global = *(char **) (tls + EGL_TLS_GLOBAL);
+    if (!global) {
+        snprintf(msg, len, "no EGL global data");
         return -1;
     }
 
-    for (unsigned int i = 0; i < count; i++) {
-        if (ids[i].eDeviceClass == VP_DEVICE_CLASS_3D) {
-            rv = PVRSRVAcquireDeviceData(connection, ids[i].ui32DeviceIndex, &dev_data, VP_DEVICE_TYPE_UNKNOWN);
-            if (rv) {
-                snprintf(msg, len, "PVRSRVAcquireDeviceData failed: %d", rv);
-                return -1;
-            }
-            break;
-        }
-    }
+    sys = global + EGL_GLOBAL_SYS_CONTEXT;
 
-    if (!dev_data.psConnection) {
-        snprintf(msg, len, "no 3D device among %u devices", count);
-        return -1;
-    }
-
-    rv = PVRSRVCreateDeviceMemContext(&dev_data, &dev_mem_context, &heaps, heap_info);
-    if (rv) {
-        snprintf(msg, len, "PVRSRVCreateDeviceMemContext failed: %d", rv);
+    if (!*(void **) sys || ((VP_DEV_DATA *) (sys + EGL_SYS_DEV_DATA))->psConnection != *(void **) sys) {
+        snprintf(msg, len, "EGL services context doesn't look right: connection %p, dev data connection %p",
+            *(void **) sys, ((VP_DEV_DATA *) (sys + EGL_SYS_DEV_DATA))->psConnection);
         return -1;
     }
 
@@ -106,7 +83,9 @@ static int init_services(char *msg, size_t len) {
         return -1;
     }
 
-    services_ready = 1;
+    dev_data = (VP_DEV_DATA *) (sys + EGL_SYS_DEV_DATA);
+    dev_mem_context = *(void **) (sys + EGL_SYS_DEV_MEM_CONTEXT);
+
     return 0;
 }
 
@@ -131,7 +110,7 @@ PyObject *RPVITA_pixmap_texture(int width, int height) {
     pixmap->sizeX = width;
     pixmap->sizeY = height;
     pixmap->memType = SCE_KERNEL_MEMBLOCK_TYPE_USER_CDRAM_RW;
-    pixmap->psDevData = &dev_data;
+    pixmap->psDevData = dev_data;
     pixmap->hDevMemContext = (unsigned int) dev_mem_context;
 
     image = create_image(eglGetCurrentDisplay(), EGL_NO_CONTEXT, EGL_NATIVE_PIXMAP_KHR, (EGLClientBuffer) pixmap, NULL);
