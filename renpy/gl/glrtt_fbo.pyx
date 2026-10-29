@@ -38,6 +38,10 @@ cdef GLint root_fbo
 # The renderbuffer object we use.
 cdef GLuint texture
 
+# Render into the destination texture itself, instead of into our own
+# texture followed by a copy.
+cdef bint direct = renpy.vita
+
 class FboRtt(Rtt):
     """
     This class uses texture copying to implement Render-to-texture.
@@ -49,6 +53,11 @@ class FboRtt(Rtt):
         renpy.display.log.write("Root FBO is: %d", root_fbo)
 
         glGenFramebuffers(1, &fbo)
+
+        if direct:
+            self.size_limit = 2048
+            return
+
         glGenTextures(1, &texture)
 
         cdef int i
@@ -78,7 +87,9 @@ class FboRtt(Rtt):
 
         glBindFramebuffer(GL_FRAMEBUFFER, root_fbo)
         glDeleteFramebuffers(1, &fbo)
-        glDeleteTextures(1, &texture)
+
+        if not direct:
+            glDeleteTextures(1, &texture)
 
     def begin(self):
         """
@@ -98,16 +109,26 @@ class FboRtt(Rtt):
         try:
             glBindFramebuffer(GL_FRAMEBUFFER, fbo)
 
+            if direct:
+                # Draw straight into the destination texture. Copying a
+                # rendered image into a texture is slow on tile-based GPUs
+                # such as the PS Vita's SGX543.
+                glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, texture, 0)
+
             environ.viewport(0, 0, w, h)
             environ.ortho(x, x + w, y, y + h, -1, 1)
 
             draw_func(x, y, w, h)
 
-            glBindTexture(GL_TEXTURE_2D, texture)
-            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL)
-            glCopyTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 0, 0, w, h, 0)
+            if not direct:
+                glBindTexture(GL_TEXTURE_2D, texture)
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL)
+                glCopyTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 0, 0, w, h, 0)
 
         finally:
+            if direct:
+                glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0)
+
             glBindFramebuffer(GL_FRAMEBUFFER, root_fbo)
 
 

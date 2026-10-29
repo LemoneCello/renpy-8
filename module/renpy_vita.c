@@ -51,9 +51,13 @@ static int audio_port = -1;
  * Off unless video_set_zero_copy(1); otherwise frames are converted on the
  * CPU and returned as surfaces (read_video).
  */
-#define FRAME_POOL_SIZE 4
-#define FRAME_POOL_TEXELS_X 256
-#define FRAME_POOL_TEXELS_Y 2048
+/* AvPlayer asks for all its output frames in one allocation (three
+ * 960x544 NV12 frames: 2.25 MiB), besides 1 MiB-aligned decoder memory,
+ * which isn't served from the pool. */
+#define FRAME_POOL_SIZE 2
+#define FRAME_POOL_TEXELS_X 512
+#define FRAME_POOL_TEXELS_Y 1536
+#define FRAME_POOL_MAX_ALIGNMENT (256 * 1024)
 
 static VitaPixmap frame_pool[FRAME_POOL_SIZE];
 static int frame_pool_used[FRAME_POOL_SIZE];
@@ -356,7 +360,8 @@ static void *gpu_alloc(void *p, uint32_t alignment, uint32_t size) {
 
     if (zero_copy) {
         for (int i = 0; i < FRAME_POOL_SIZE; i++) {
-            if (!frame_pool_used[i] && size <= frame_pool[i].size) {
+            if (!frame_pool_used[i] && size <= frame_pool[i].size && alignment <= FRAME_POOL_MAX_ALIGNMENT
+                    && ((uintptr_t) frame_pool[i].base % alignment) == 0) {
                 frame_pool_used[i] = 1;
                 if (alloc_log_count < ALLOC_LOG_SIZE) {
                     alloc_log[alloc_log_count].alignment = alignment;

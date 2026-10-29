@@ -553,7 +553,7 @@ cdef class GLDraw:
                 "fbo",
                 "GL_ARB_framebuffer_object")
 
-        if use_fbo and not renpy.vita:
+        if use_fbo:
             renpy.display.log.write("Using FBO RTT.")
             self.rtt = glrtt_fbo.FboRtt()
             self.info["rtt"] = "fbo"
