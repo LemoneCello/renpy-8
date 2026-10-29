@@ -47,6 +47,11 @@ static void *dev_mem_context = NULL;
 
 static PFNEGLCREATEIMAGEKHRPROC create_image = NULL;
 
+int vita_pixmap_gl_thread(void) {
+    void **slot = (void **) sceKernelGetTLSAddr(EGL_TLS_KEY);
+    return slot && *slot;
+}
+
 static int init_services(char *msg, size_t len) {
     void **slot;
     char *tls;

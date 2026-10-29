@@ -32,6 +32,7 @@ static void mem_free(void *p, void* pMemory);
 static void *gpu_alloc(void* p, uint32_t alignment, uint32_t size);
 static void gpu_free(void* p, void* pMemory);
 static void event_callback(void *p, int32_t argEventId, int32_t argSourceId, void *argEventData);
+int RPVITA_video_prepare();
 
 enum {
   PLAYER_INACTIVE,
@@ -275,15 +276,9 @@ void RPVITA_video_start(const char *file) {
         }
     }
 
-    if (zero_copy_wanted && frame_pool_state == 0) {
-        frame_pool_state = 1;
-        for (int i = 0; i < FRAME_POOL_SIZE; i++) {
-            if (vita_pixmap_create(FRAME_POOL_TEXELS_X, FRAME_POOL_TEXELS_Y, 1, &frame_pool[i], zero_copy_msg, sizeof(zero_copy_msg))) {
-                frame_pool_state = -1;
-                break;
-            }
-        }
-    }
+    // Channels usually start from the periodic audio thread, where the
+    // pool can't be made; video_prepare makes it on the main thread.
+    RPVITA_video_prepare();
 
     zero_copy = zero_copy_wanted && frame_pool_state == 1;
     last_zero_copy_ts = (uint64_t) -1;
@@ -646,6 +641,22 @@ static void zc_convert(VitaPixmap *block, uint8_t *data, int width, int height) 
 
 void RPVITA_video_set_zero_copy(int enabled) {
     zero_copy_wanted = enabled;
+}
+
+/* Makes the frame pool if zero-copy is wanted and this is the GL thread.
+ * Returns the pool state (1 ready, 0 not made, -1 failed). */
+int RPVITA_video_prepare() {
+    if (zero_copy_wanted && frame_pool_state == 0 && vita_pixmap_gl_thread()) {
+        frame_pool_state = 1;
+        for (int i = 0; i < FRAME_POOL_SIZE; i++) {
+            if (vita_pixmap_create(FRAME_POOL_TEXELS_X, FRAME_POOL_TEXELS_Y, 1, &frame_pool[i], zero_copy_msg, sizeof(zero_copy_msg))) {
+                frame_pool_state = -1;
+                break;
+            }
+        }
+    }
+
+    return frame_pool_state;
 }
 
 int RPVITA_video_zero_copy() {

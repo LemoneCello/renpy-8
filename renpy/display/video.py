@@ -122,6 +122,9 @@ def interact():
 
     global fullscreen
 
+    if renpy.vita:
+        renpy.audio.vitahw.prepare()
+
     for i in list(texture.keys()):
         if not renpy.audio.music.get_playing(i):
             del texture[i]

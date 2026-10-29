@@ -7,6 +7,7 @@ cdef extern from "renpy_vita.h":
     int RPVITA_video_get_playing()
     void RPVITA_periodic()
     void RPVITA_video_set_zero_copy(int enabled)
+    int RPVITA_video_prepare()
     int RPVITA_video_zero_copy()
     object RPVITA_video_read_texture()
     object RPVITA_video_debug()
@@ -53,6 +54,14 @@ def video_set_zero_copy(enabled):
     """
 
     RPVITA_video_set_zero_copy(1 if enabled else 0)
+
+def video_prepare():
+    """
+    Call on the main (GL) thread: makes the zero-copy frame pool if
+    video_set_zero_copy(True) was called. Returns 1 (ready), 0 or -1.
+    """
+
+    return RPVITA_video_prepare()
 
 def video_zero_copy():
     return RPVITA_video_zero_copy()

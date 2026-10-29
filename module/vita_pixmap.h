@@ -14,6 +14,9 @@ typedef struct {
     int height;
 } VitaPixmap;
 
+/* True on a thread with EGL state (the GL thread). */
+int vita_pixmap_gl_thread(void);
+
 /* Creates one; call on the GL thread. Returns 0, or -1 with a message. */
 int vita_pixmap_create(int width, int height, int nearest, VitaPixmap *out, char *msg, size_t len);
 

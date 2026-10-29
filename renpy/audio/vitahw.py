@@ -4,6 +4,18 @@ from renpy.audio.audio import MusicContext
 import sys
 
 
+def prepare():
+    """
+    Called on the main thread at each interaction: makes the GPU-shared
+    memory zero-copy movies decode into, once, as that needs the GL thread
+    (channels start movies from the periodic audio thread).
+    """
+
+    if renpy.config.vita_zero_copy_video:
+        renpyvita.video_set_zero_copy(True)
+        renpyvita.video_prepare()
+
+
 class VitaVideoChannel(object):
 
     def __init__(self, name, file_prefix="", file_suffix="", default_loop=None):
