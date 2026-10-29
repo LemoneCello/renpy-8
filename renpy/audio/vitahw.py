@@ -95,13 +95,18 @@ class VitaVideoChannel(object):
         if not self.queue:
             return
 
-        filename = sys.argv[0] + "/game/" + self.queue.pop(0)
+        name = self.queue.pop(0)
+        filename = sys.argv[0] + "/game/" + name
 
         real_filename = filename.encode('utf-8')
 
         print("Playing", filename, real_filename)
 
         renpyvita.video_set_zero_copy(renpy.config.vita_zero_copy_video)
+
+        # A loop of one file loops in the player, without a gap (as Ren'Py's
+        # own channels do); other loops are queued again in periodic().
+        renpyvita.video_set_looping(not self.queue and self.loop == [ name ])
         renpyvita.video_start(real_filename)
 
     def stop(self):
@@ -127,6 +132,9 @@ class VitaVideoChannel(object):
         if self.get_playing():
             return
 
+        if not self.queue and self.loop:
+            self.queue.extend(self.loop)
+
         if self.queue:
             self.start()
 
@@ -140,6 +148,8 @@ class VitaVideoChannel(object):
             self.queue = [ ]
         else:
             self.queue = self.queue[:1]
+
+        self.loop = [ ]
 
     def interact(self):
         """
@@ -156,9 +166,14 @@ class VitaVideoChannel(object):
 
         self.stop()
         self.queue = [ ]
+        self.loop = [ ]
 
     def enqueue(self, filenames, loop=True, synchro_start=False, fadein=0, tight=None, loop_only=False, relative_volume=1.0):
-        self.queue.extend(filenames)
+        if not loop_only:
+            self.queue.extend(filenames)
+
+        # As Ren'Py's Channel.enqueue: what to play again when the queue runs out.
+        self.loop = list(filenames) if loop else [ ]
 
     def set_volume(self, volume):
         pass

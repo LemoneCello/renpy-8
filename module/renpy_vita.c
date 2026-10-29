@@ -254,6 +254,14 @@ int movie_audio_thread(void *data) {
     return 0;
 }
 
+// Whether the next movie started loops by itself (sceAvPlayerSetLooping):
+// set by the channel for a single-file loop, as Ren'Py's own channels do.
+static int looping_wanted = 0;
+
+void RPVITA_video_set_looping(int enabled) {
+    looping_wanted = enabled;
+}
+
 void RPVITA_video_start(const char *file) {
     SceAvPlayerInitData playerInit;
     memset(&playerInit, 0, sizeof(SceAvPlayerInitData));
@@ -305,6 +313,10 @@ void RPVITA_video_start(const char *file) {
     SDL_UnlockMutex(frame_mutex);
 
     sceAvPlayerAddSource(mp->handle, file);
+
+    if (looping_wanted) {
+        sceAvPlayerSetLooping(mp->handle, 1);
+    }
 }
 
 void RPVITA_video_stop() {

@@ -7,6 +7,7 @@ cdef extern from "renpy_vita.h":
     int RPVITA_video_get_playing()
     void RPVITA_periodic()
     void RPVITA_video_set_zero_copy(int enabled)
+    void RPVITA_video_set_looping(int enabled)
     int RPVITA_video_prepare()
     int RPVITA_video_zero_copy()
     object RPVITA_video_read_texture()
@@ -54,6 +55,13 @@ def video_set_zero_copy(enabled):
     """
 
     RPVITA_video_set_zero_copy(1 if enabled else 0)
+
+def video_set_looping(enabled):
+    """
+    If true, movies started afterwards loop by themselves until stopped.
+    """
+
+    RPVITA_video_set_looping(1 if enabled else 0)
 
 def video_prepare():
     """
