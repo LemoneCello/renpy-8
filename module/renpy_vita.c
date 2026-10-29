@@ -1,6 +1,7 @@
 #include "renpy_vita.h"
 #include <stdlib.h>
 #include "psp2/kernel/processmgr.h"
+#include "psp2/kernel/threadmgr.h"
 #include "psp2/sysmodule.h"
 #include "psp2/avplayer.h"
 #include "psp2/kernel/sysmem.h"
@@ -91,6 +92,10 @@ int fetch_frame_thread() {
                     received_frames += 1;
                     SDL_UnlockMutex(frame_mutex);
                 }
+            } else {
+                // No new frame yet: wait rather than spin (this thread used
+                // to poll AvPlayer in a tight loop).
+                sceKernelDelayThread(2000);
             }
         } else {
             player_state = PLAYER_STOP;
