@@ -147,7 +147,7 @@ cython(
 
 cython(
     "renpy.renpyvita",
-    [ "renpy_vita.c", ],
+    [ "renpy_vita.c", "vita_pixmap.c" ],
     libs=sdl,
     define_macros=macros)
 

@@ -11,3 +11,8 @@ void RPVITA_video_start(const char *file);
 void RPVITA_video_stop();
 int RPVITA_video_get_playing();
 void RPVITA_periodic();
+
+/* GPU-shared textures (vita_pixmap.c) */
+
+PyObject *RPVITA_pixmap_texture(int width, int height);
+void RPVITA_pixmap_fill(unsigned long address, int width, int height, int phase);
