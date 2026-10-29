@@ -12,6 +12,7 @@ void RPVITA_video_stop();
 int RPVITA_video_get_playing();
 void RPVITA_periodic();
 void RPVITA_video_set_zero_copy(int enabled);
+int RPVITA_video_zero_copy();
 PyObject *RPVITA_video_read_texture();
 PyObject *RPVITA_video_debug();
 

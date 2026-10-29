@@ -154,6 +154,20 @@ def get_movie_texture(channel, mask_channel=None, side_mask=False, mipmap=None):
         return get_movie_texture_web(channel, mask_channel, side_mask, mipmap)
 
     c = renpy.audio.music.get_channel(channel)
+
+    # The Vita's zero-copy movies are converted to a texture on the GPU
+    # (renpy.audio.vitahw); masks aren't applied to them.
+    read_video_texture = getattr(c, "read_video_texture", None)
+
+    if read_video_texture is not None and c.zero_copy():
+        tex = read_video_texture()
+
+        if tex is not None:
+            texture[channel] = tex
+            return tex, True
+
+        return texture.get(channel, None), False
+
     surf = c.read_video()
 
     if side_mask:

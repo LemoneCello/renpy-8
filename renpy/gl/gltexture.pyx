@@ -887,6 +887,31 @@ def compute_tiling(width, max_size, min_fill_factor):
     return row, tiles
 
 
+def texture_grid_from_number(unsigned int number, int width, int height):
+    """
+    Wraps an existing GL texture, `width` by `height`, in a TextureGrid of
+    one tile. Ren'Py doesn't own the texture: it's never freed, reused or
+    deleted here, and whoever made it may keep changing its contents. Used
+    for the Vita's zero-copy video frames.
+    """
+
+    cdef TextureCore t = TextureCore(width, height)
+
+    t.number = number
+    t.format = tex_internalformat
+    t.xadd = 0
+    t.yadd = 0
+    t.xmul = 1.0 / width
+    t.ymul = 1.0 / height
+
+    rv = TextureGrid(width, height)
+    rv.columns = [ (0, width, 0) ]
+    rv.rows = [ (0, height, 0) ]
+    rv.tiles = [ [ t ] ]
+
+    return rv
+
+
 def texture_grid_from_surface(surf, transient, properties):
     """
     This takes a Surface and turns it into a TextureGrid.

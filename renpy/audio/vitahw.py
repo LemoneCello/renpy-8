@@ -89,6 +89,7 @@ class VitaVideoChannel(object):
 
         print("Playing", filename, real_filename)
 
+        renpyvita.video_set_zero_copy(renpy.config.vita_zero_copy_video)
         renpyvita.video_start(real_filename)
 
     def stop(self):
@@ -172,6 +173,36 @@ class VitaVideoChannel(object):
 
     def read_video(self):
         return renpyvita.video_read_video()
+
+    # The GL texture zero-copy frames are converted into, wrapped once.
+    texture = None
+    texture_key = None
+
+    def zero_copy(self):
+        """
+        True if the playing movie decodes into GPU-shared memory, so its
+        frames come from read_video_texture rather than read_video.
+        """
+
+        return renpyvita.video_zero_copy()
+
+    def read_video_texture(self):
+        """
+        Returns a TextureGrid when a new frame of a zero-copy movie has been
+        converted, else None. Every frame goes into the same GL texture.
+        """
+
+        r = renpyvita.video_read_texture()
+
+        if r is None:
+            return None
+
+        if r != self.texture_key:
+            import renpy.gl.gltexture
+            self.texture = renpy.gl.gltexture.texture_grid_from_number(*r)
+            self.texture_key = r
+
+        return self.texture
 
     def video_ready(self):
         return 1

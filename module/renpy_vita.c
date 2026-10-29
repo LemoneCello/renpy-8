@@ -590,6 +590,10 @@ void RPVITA_video_set_zero_copy(int enabled) {
     zero_copy_wanted = enabled;
 }
 
+int RPVITA_video_zero_copy() {
+    return zero_copy && player_state == PLAYER_ACTIVE;
+}
+
 /*
  * Zero-copy movies: if a new frame is due, converts it and returns
  * (texture, width, height); the same GL texture is reused for every frame.

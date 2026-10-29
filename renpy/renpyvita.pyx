@@ -7,6 +7,7 @@ cdef extern from "renpy_vita.h":
     int RPVITA_video_get_playing()
     void RPVITA_periodic()
     void RPVITA_video_set_zero_copy(int enabled)
+    int RPVITA_video_zero_copy()
     object RPVITA_video_read_texture()
     object RPVITA_video_debug()
     object RPVITA_pixmap_texture(int width, int height)
@@ -52,6 +53,9 @@ def video_set_zero_copy(enabled):
     """
 
     RPVITA_video_set_zero_copy(1 if enabled else 0)
+
+def video_zero_copy():
+    return RPVITA_video_zero_copy()
 
 def video_read_texture():
     """

@@ -1142,6 +1142,11 @@ mipmap_movies = False
 # Should text be mipmapped by default?
 mipmap_text = False
 
+# On the Vita, should movies decode straight into GPU-shared memory and be
+# converted to RGB on the GPU (no per-frame upload)? Masks aren't applied
+# to such movies.
+vita_zero_copy_video = True
+
 # Should the screensaver be allowed?
 allow_screensaver = True
 
