@@ -1021,6 +1021,7 @@ class RollbackLog(renpy.object.Object):
 
         # Stop the sounds.
         renpy.audio.audio.rollback()
+        renpy.display.video.rollback()
 
         # Stop any hiding in progress.
         for i in renpy.game.contexts:

@@ -104,14 +104,35 @@ reset_channels = set()
 group_texture = { }
 
 
+# Vita: after a rollback, replay the movies the restored screen shows. The
+# rolled-back context says they are already playing on their channel, but
+# audio.rollback() stopped it (Movie images all share the "movie" channel
+# there), so update_playing() never started them again and a movie that was
+# on screen at the rollback point stayed blank. Set by rollback(), armed by
+# the next early_interact(), used by the first update_playing() after it.
+rollback_state = None
+
+
+def rollback():
+    global rollback_state
+
+    if renpy.vita:
+        rollback_state = "pending"
+
+
 def early_interact():
     """
     Called early in the interact process, to clear out the fullscreen
     flag.
     """
 
+    global rollback_state
+
     displayable_channels.clear()
     channel_movie.clear()
+
+    if rollback_state == "pending":
+        rollback_state = "armed"
 
 
 def interact():
@@ -695,8 +716,13 @@ def update_playing():
     """
 
     global last_channel_movie
+    global rollback_state
 
     old_channel_movie = renpy.game.context().movie
+
+    if rollback_state == "armed":
+        rollback_state = None
+        old_channel_movie = { }
 
     for c, m in channel_movie.items():
 
