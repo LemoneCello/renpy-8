@@ -52,7 +52,21 @@ typedef struct {
     volatile int threads_started;  /* set at READY */
     volatile int audio_running;
     volatile int closed;
+    int looping;                   /* loop until stopped */
+    int looping_set;               /* sceAvPlayerSetLooping called */
 } MoviePlayer;
+
+/*
+ * Looping is switched on once the first video frame has arrived: set any
+ * earlier (after AddSource, or at READY), a short movie with an audio track
+ * (under ~2 s; 9 s ones were fine) never produced a video frame.
+ */
+static void start_looping(MoviePlayer *mp) {
+    if (mp && mp->looping && !mp->looping_set) {
+        sceAvPlayerSetLooping(mp->handle, 1);
+        mp->looping_set = 1;
+    }
+}
 
 static MoviePlayer *current_player = NULL;
 SceAvPlayerHandle movie_player;
@@ -164,6 +178,8 @@ int fetch_frame_thread(void *data) {
 
                     // Convert pixel format
                     convert_nv12_to_rgba(video_frame_info.pData, video_buffer, width, height);
+
+                    start_looping(mp);
 
                     SDL_LockMutex(frame_mutex);
                     memcpy(frame_buffer[0], video_buffer, width * height * 4);
@@ -312,11 +328,8 @@ void RPVITA_video_start(const char *file) {
     player_state = PLAYER_ACTIVE;
     SDL_UnlockMutex(frame_mutex);
 
+    mp->looping = looping_wanted;
     sceAvPlayerAddSource(mp->handle, file);
-
-    if (looping_wanted) {
-        sceAvPlayerSetLooping(mp->handle, 1);
-    }
 }
 
 void RPVITA_video_stop() {
@@ -713,6 +726,10 @@ PyObject *RPVITA_video_read_texture() {
     zc_convert(block, info.pData, width, height);
     last_zero_copy_ts = info.timeStamp;
     zero_copy_frames++;
+
+    SDL_LockMutex(frame_mutex);
+    start_looping(current_player);
+    SDL_UnlockMutex(frame_mutex);
 
     return Py_BuildValue("(iii)", (int) zc_target, width, height);
 }
