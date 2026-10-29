@@ -39,6 +39,17 @@ enum {
   PLAYER_STOP,
 };
 
+/*
+ * One per movie, passed to its threads and to AvPlayer's event callback, so
+ * each works on its own player: when a movie ends, the next one usually
+ * starts before the old threads have closed theirs. (Never freed; a few
+ * bytes per movie.)
+ */
+typedef struct {
+    SceAvPlayerHandle handle;
+} MoviePlayer;
+
+static MoviePlayer *current_player = NULL;
 SceAvPlayerHandle movie_player;
 int player_state = PLAYER_INACTIVE;
 static SDL_mutex *frame_mutex;
@@ -109,11 +120,31 @@ static uint8_t frame_buffer[2][MAX_WIDTH * MAX_HEIGHT * 4];
 void RPVITA_periodic() {
 }
 
-int fetch_frame_thread() {
+static int player_current(MoviePlayer *mp) {
+    return mp == current_player && player_state == PLAYER_ACTIVE;
+}
+
+// Closes a movie's player; resets the shared state if it's still the
+// current movie.
+static void close_player(MoviePlayer *mp) {
+    sceAvPlayerStop(mp->handle);
+    sceAvPlayerClose(mp->handle);
+
+    SDL_LockMutex(frame_mutex);
+    if (mp == current_player) {
+        player_state = PLAYER_INACTIVE;
+        received_frames = 0;
+    }
+    SDL_UnlockMutex(frame_mutex);
+}
+
+int fetch_frame_thread(void *data) {
+    MoviePlayer *mp = (MoviePlayer *) data;
+
     // Fetch video frame
-    while (player_state == PLAYER_ACTIVE) {
-        if (sceAvPlayerIsActive(movie_player)) {
-            if (sceAvPlayerGetVideoData(movie_player, &video_frame_info)) {
+    while (player_current(mp)) {
+        if (sceAvPlayerIsActive(mp->handle)) {
+            if (sceAvPlayerGetVideoData(mp->handle, &video_frame_info)) {
                 int width = video_frame_info.details.video.width;
                 int height = video_frame_info.details.video.height;
 
@@ -134,17 +165,11 @@ int fetch_frame_thread() {
                 sceKernelDelayThread(2000);
             }
         } else {
-            player_state = PLAYER_STOP;
+            break;
         }
     }
 
-    // If video stop, close av player
-    if (player_state == PLAYER_STOP) {
-        sceAvPlayerStop(movie_player);
-        sceAvPlayerClose(movie_player);
-        player_state = PLAYER_INACTIVE;
-        received_frames = 0;
-    }
+    close_player(mp);
     printf("Video thread exit\n");
     return 0;
 }
@@ -152,21 +177,14 @@ int fetch_frame_thread() {
 // Zero-copy movies: frames are fetched on the main thread
 // (video_read_texture); this only notices the end of the movie and closes
 // the player, as fetch_frame_thread does.
-int monitor_thread() {
-    while (player_state == PLAYER_ACTIVE) {
-        if (!sceAvPlayerIsActive(movie_player)) {
-            player_state = PLAYER_STOP;
-            break;
-        }
+int monitor_thread(void *data) {
+    MoviePlayer *mp = (MoviePlayer *) data;
+
+    while (player_current(mp) && sceAvPlayerIsActive(mp->handle)) {
         sceKernelDelayThread(10000);
     }
 
-    if (player_state == PLAYER_STOP) {
-        sceAvPlayerStop(movie_player);
-        sceAvPlayerClose(movie_player);
-        player_state = PLAYER_INACTIVE;
-        received_frames = 0;
-    }
+    close_player(mp);
     return 0;
 }
 
@@ -202,15 +220,16 @@ PyObject *RPVITA_video_read_video() {
 }
 
 
-int movie_audio_thread() {
+int movie_audio_thread(void *data) {
+    MoviePlayer *mp = (MoviePlayer *) data;
     SceAvPlayerFrameInfo frame;
     memset(&frame, 0, sizeof(SceAvPlayerFrameInfo));
 
     uint8_t *noSound = (uint8_t *) memalign(0x20, 4096 * 4);
     memset(noSound, 0, 4096 * 4);
 
-    while (player_state == PLAYER_ACTIVE && sceAvPlayerIsActive(movie_player)) {
-        if (sceAvPlayerGetAudioData(movie_player, &frame)) {
+    while (player_current(mp) && sceAvPlayerIsActive(mp->handle)) {
+        if (sceAvPlayerGetAudioData(mp->handle, &frame)) {
             sceAudioOutSetConfig(audio_port, 1024, frame.details.audio.sampleRate,
                     frame.details.audio.channelCount == 1 ? SCE_AUDIO_OUT_MODE_MONO : SCE_AUDIO_OUT_MODE_STEREO);
             sceAudioOutOutput(audio_port, frame.pData);
@@ -246,15 +265,22 @@ void RPVITA_video_start(const char *file) {
     playerInit.memoryReplacement.deallocateTexture = gpu_free;
     playerInit.eventReplacement.eventCallback = event_callback;
 
+    MoviePlayer *mp = (MoviePlayer *) calloc(1, sizeof(MoviePlayer));
+    playerInit.eventReplacement.objectPointer = mp;
+
     playerInit.basePriority = 0xA0;
     playerInit.numOutputVideoFrameBuffers = zero_copy ? 3 : 2;
     playerInit.autoStart = 0;
 
-    movie_player = sceAvPlayerInit(&playerInit);
+    mp->handle = sceAvPlayerInit(&playerInit);
 
-    sceAvPlayerAddSource(movie_player, file);
-
+    SDL_LockMutex(frame_mutex);
+    current_player = mp;
+    movie_player = mp->handle;
     player_state = PLAYER_ACTIVE;
+    SDL_UnlockMutex(frame_mutex);
+
+    sceAvPlayerAddSource(mp->handle, file);
 }
 
 void RPVITA_video_stop() {
@@ -266,17 +292,18 @@ int RPVITA_video_get_playing() {
 }
 
 static void event_callback(void *p, int32_t argEventId, int32_t argSourceId, void *argEventData) {
+    MoviePlayer *mp = (MoviePlayer *) p;
     printf("Player Event: %d\n", argEventId);
 
     if (argEventId == SCE_AVPLAYER_STATE_READY) {
         SceAvPlayerStreamInfo info;
         memset(&info, 0, sizeof(SceAvPlayerStreamInfo));
 
-        int n = sceAvPlayerStreamCount(movie_player);
+        int n = sceAvPlayerStreamCount(mp->handle);
         printf("Stream count: %d\n", n);
 
         for (int i = 0; i < n; i++) {
-            sceAvPlayerGetStreamInfo(movie_player, i, &info);
+            sceAvPlayerGetStreamInfo(mp->handle, i, &info);
 
             if (info.type == SCE_AVPLAYER_AUDIO) {
                 printf("Video: audio stream: freq=%d, channels=%d\n",
@@ -284,26 +311,26 @@ static void event_callback(void *p, int32_t argEventId, int32_t argSourceId, voi
 
                 // Enable
                 printf("Enable audio stream\n");
-                sceAvPlayerEnableStream(movie_player, i);
+                sceAvPlayerEnableStream(mp->handle, i);
             } else if (info.type == SCE_AVPLAYER_VIDEO) {
                 printf("Video: video stream: width=%d, height=%d, lang=%d\n",
                         info.details.video.width, info.details.video.height, info.details.video.languageCode);
 
                 // Enable
                 printf("Enable video stream\n");
-                sceAvPlayerEnableStream(movie_player, i);
+                sceAvPlayerEnableStream(mp->handle, i);
             }
         }
 
-        printf("Video ts: %ld\n", sceAvPlayerCurrentTime(movie_player));
+        printf("Video ts: %ld\n", sceAvPlayerCurrentTime(mp->handle));
         printf("Start video\n");
-        sceAvPlayerStart(movie_player);
+        sceAvPlayerStart(mp->handle);
         if (zero_copy) {
-            SDL_CreateThread(monitor_thread, "Video monitor", NULL);
+            SDL_CreateThread(monitor_thread, "Video monitor", mp);
         } else {
-            SDL_CreateThread(fetch_frame_thread, "Video fetch frame", NULL);
+            SDL_CreateThread(fetch_frame_thread, "Video fetch frame", mp);
         }
-        SDL_CreateThread(movie_audio_thread, "Movie audio thread", NULL);
+        SDL_CreateThread(movie_audio_thread, "Movie audio thread", mp);
     }
 }
 
