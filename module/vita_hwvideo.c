@@ -36,6 +36,7 @@
 #include <psp2/sysmodule.h>
 #include <psp2/videodec.h>
 #include <psp2/audioout.h>
+#include <psp2/power.h>
 #include <libavformat/avformat.h>
 #include <libavcodec/avcodec.h>
 #include <libavcodec/bsf.h>
@@ -145,6 +146,54 @@ typedef struct {
 } HwPlayer;
 
 static HwPlayer players[HW_MAX];
+
+/* With the library set up for two streams, the app can't be suspended
+   while a decode call is running: the system hung, with a black LiveArea,
+   when the PS button was pressed during a movie (2026-10-30; idle decoders,
+   and the public one-stream setup AvPlayer uses, were fine). Apps get no
+   suspend notification, but the PS and power button presses arrive as
+   power callbacks before the app is frozen, so decoding pauses for
+   HW_PAUSE_US after any such event (sound and showing decoded pictures go
+   on), and resumes at once when the app is told it has resumed. */
+#define HW_PAUSE_EVENTS (SCE_POWER_CB_BUTTON_PS_PRESS | SCE_POWER_CB_BUTTON_PS_HOLD | SCE_POWER_CB_BUTTON_PS_START_PRESS \
+    | SCE_POWER_CB_BUTTON_PS_POWER_PRESS | SCE_POWER_CB_BUTTON_POWER_PRESS | SCE_POWER_CB_BUTTON_POWER_HOLD \
+    | SCE_POWER_CB_SYSTEM_SUSPEND | SCE_POWER_CB_APP_SUSPEND | SCE_POWER_CB_THERMAL_SUSPEND \
+    | SCE_POWER_CB_LOW_BATTERY_SUSPEND)
+#define HW_RESUME_EVENTS (SCE_POWER_CB_APP_RESUME | SCE_POWER_CB_SYSTEM_RESUME | SCE_POWER_CB_AFTER_SYSTEM_RESUME)
+#define HW_PAUSE_US 3000000
+static volatile SceUInt64 pause_until = 0;
+static volatile int power_events = 0, power_last = 0;
+
+static int power_cb(int notifyId, int notifyCount, int powerInfo, void *common) {
+    power_events++;
+    power_last = powerInfo;
+    if (powerInfo & HW_PAUSE_EVENTS) {
+        pause_until = sceKernelGetProcessTimeWide() + HW_PAUSE_US;
+    } else if (powerInfo & HW_RESUME_EVENTS) {
+        pause_until = 0;
+    }
+    return 0;
+}
+
+static int power_thread(SceSize args, void *argp) {
+    SceUID cb = sceKernelCreateCallback("hwvideo power", 0, (SceKernelCallbackFunction) power_cb, NULL);
+    scePowerRegisterCallback(cb);
+    for (;;) {
+        sceKernelDelayThreadCB(100000);
+    }
+    return 0;
+}
+
+/* Waits while decoding is paused; -1 if the player is stopping. */
+static int wait_unpaused(volatile int *stop) {
+    while (sceKernelGetProcessTimeWide() < pause_until) {
+        if (*stop) {
+            return -1;
+        }
+        sceKernelDelayThread(10000);
+    }
+    return 0;
+}
 static int lib_state = 0;          /* 0 not tried, 1 ready, < 0 failed */
 static char lib_msg[160] = "";
 static SceUID lib_block = -1, lib_unmap = -1;
@@ -400,6 +449,13 @@ static int lib_init(void) {
         return lib_state;
     }
 
+    /* High priority, so a button press is handled before the app is
+       frozen. */
+    SceUID t = sceKernelCreateThread("hwvideo power", power_thread, 96, 0x4000, 0, 0, NULL);
+    if (t >= 0) {
+        sceKernelStartThread(t, 0, NULL);
+    }
+
     lib_state = 1;
     return lib_state;
 }
@@ -491,6 +547,9 @@ static int decode_au(HwPlayer *p, AVPacket *pkt) {
         array.numOfElm = 1;
         array.pPicture = pics;
 
+        if (wait_unpaused(&p->stop)) {
+            return -1;
+        }
         int rc = pkt ? sceAvcdecDecode(&p->ctrl, &au, &array) : sceAvcdecDecodeStop(&p->ctrl, &array);
 
         if (array.numOfOutput) {
@@ -1013,7 +1072,8 @@ PyObject *RPVITA_hwvideo_read_texture(int handle) {
 PyObject *RPVITA_hwvideo_debug(int handle) {
     HwPlayer *p = lookup(handle);
     if (!p) {
-        return Py_BuildValue("{s:i,s:i,s:s}", "lib", lib_state, "targets", targets_state, "msg", lib_msg);
+        return Py_BuildValue("{s:i,s:i,s:s,s:i,s:i}", "lib", lib_state, "targets", targets_state, "msg", lib_msg,
+                             "power_events", power_events, "power_last", power_last);
     }
     double clock = p->t0 ? clock_now(p) / (double) HW_TS : -1.0;
     return Py_BuildValue("{s:i,s:i,s:i,s:i,s:i,s:i,s:i,s:i,s:i,s:d,s:d,s:L,s:L,s:s,s:i,s:i}",
