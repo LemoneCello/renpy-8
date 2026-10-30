@@ -325,8 +325,14 @@ class VitaVideoChannel(object):
             return None
 
         if r != self.texture_key:
-            import renpy.gl.gltexture
-            self.texture = renpy.gl.gltexture.texture_grid_from_number(*r)
+            # (Imported "as": a plain "import renpy.x" would make renpy a
+            # local name of this function.)
+            if type(renpy.display.draw).__module__.startswith("renpy.gl2."):
+                import renpy.gl2.gl2texture as gl2texture
+                self.texture = gl2texture.texture_from_number(*r)
+            else:
+                import renpy.gl.gltexture as gltexture
+                self.texture = gltexture.texture_grid_from_number(*r)
             self.texture_key = r
 
         return self.texture

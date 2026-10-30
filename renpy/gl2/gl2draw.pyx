@@ -83,6 +83,32 @@ frame_times = [ ]
 
 
 
+cdef GLuint vita_color_texture(GLuint renderbuffer, int width, int height):
+    """
+    On the Vita, the colour buffers of gl2's framebuffer objects are textures
+    rather than renderbuffers: what the PVR driver renders into an RGBA8
+    renderbuffer reads back (glReadPixels, glCopyTexImage2D) as garbage,
+    while rendering into textures works. Replaces `renderbuffer` with a new
+    texture attached to the bound framebuffer, and returns it.
+    """
+
+    cdef GLuint tex
+
+    glDeleteRenderbuffers(1, &renderbuffer)
+
+    glGenTextures(1, &tex)
+    glBindTexture(GL_TEXTURE_2D, tex)
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST)
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST)
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL)
+
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0)
+
+    return tex
+
+
 cdef class GL2Draw:
 
     def __init__(self, name):
@@ -282,7 +308,12 @@ cdef class GL2Draw:
 
         pygame.display.gl_set_attribute(pygame.GL_SWAP_CONTROL, vsync)
 
-        if gles:
+        if gles and renpy.vita:
+            # The Vita's GPU (SGX543) only does OpenGL ES 2.0.
+            pygame.display.gl_set_attribute(pygame.GL_CONTEXT_MAJOR_VERSION, 2);
+            pygame.display.gl_set_attribute(pygame.GL_CONTEXT_MINOR_VERSION, 0);
+            pygame.display.gl_set_attribute(pygame.GL_CONTEXT_PROFILE_MASK, pygame.GL_CONTEXT_PROFILE_ES)
+        elif gles:
             pygame.display.hint("SDL_OPENGL_ES_DRIVER", "1")
             pygame.display.gl_set_attribute(pygame.GL_CONTEXT_MAJOR_VERSION, 3);
             pygame.display.gl_set_attribute(pygame.GL_CONTEXT_MINOR_VERSION, 0);
@@ -366,7 +397,7 @@ cdef class GL2Draw:
 
         pwidth, pheight = self.select_physical_size(physical_size)
 
-        if renpy.android or renpy.ios:
+        if renpy.android or renpy.ios or renpy.vita:
             fullscreen = True
         elif renpy.emscripten:
             fullscreen = False
@@ -410,6 +441,11 @@ cdef class GL2Draw:
             window_flags |= pygame.WINDOW_ALLOW_HIGHDPI | pygame.RESIZABLE
             pwidth = 0
             pheight = 0
+            gles = True
+
+        elif renpy.vita:
+            pwidth = 960
+            pheight = 544
             gles = True
 
         else:
@@ -495,7 +531,7 @@ cdef class GL2Draw:
         # Do additional setup needed.
         renpy.display.pgrender.set_rgba_masks()
 
-        if renpy.android or renpy.ios:
+        if renpy.android or renpy.ios or renpy.vita:
             self.redraw_period = 1.0
 
         elif renpy.emscripten:
@@ -523,6 +559,8 @@ cdef class GL2Draw:
         # Are we in fullscreen mode?
         if renpy.emscripten:
             fullscreen = bool(emscripten.run_script_int("isFullscreen()"))
+        elif renpy.vita:
+            fullscreen = True
         else:
             fullscreen = bool(pygame.display.get_window().get_window_flags() & (pygame.WINDOW_FULLSCREEN_DESKTOP | pygame.WINDOW_FULLSCREEN))
 
@@ -614,12 +652,18 @@ cdef class GL2Draw:
         self.init_fbo()
         self.texture_loader.init()
 
+        if renpy.vita:
+            renpy.gl2.gl2texture.vita_rtt_prepare(self.texture_loader)
+
     def resize(self):
         """
         Documented in renderer.
         """
 
         fullscreen = renpy.game.preferences.fullscreen
+
+        if renpy.vita:
+            return
 
         if renpy.emscripten:
             fullscreen = False
@@ -655,6 +699,9 @@ cdef class GL2Draw:
         """
         Documented in renderer.
         """
+
+        if renpy.vita:
+            return False
 
         flags = pygame.display.get_window().get_window_flags()
 
@@ -758,6 +805,14 @@ cdef class GL2Draw:
         height = max(self.virtual_size[1] + BORDER, self.drawable_size[1] + BORDER, height)
         height = min(height, max_texture_size, max_renderbuffer_size)
 
+        if renpy.vita:
+            # The renderbuffer comes out of the GPU driver's memory, which the
+            # hardware video decoders and render targets need too (4096x4096
+            # would be 64 MiB), and the Vita only ever draws at its screen
+            # size. Larger images are split into tiles of this size.
+            width = self.drawable_size[0] + BORDER
+            height = self.drawable_size[1] + BORDER
+
         if "RENPY_MAX_TEXTURE_SIZE" in os.environ:
             width = height = int(os.environ["RENPY_MAX_TEXTURE_SIZE"])
 
@@ -769,14 +824,17 @@ cdef class GL2Draw:
         # Full-size fbo.
         self.change_fbo(self.fbo)
 
-        glBindRenderbuffer(GL_RENDERBUFFER, self.color_renderbuffer)
-        glRenderbufferStorage(GL_RENDERBUFFER, GL_RGBA8, width, height)
+        if renpy.vita:
+            self.color_renderbuffer = vita_color_texture(self.color_renderbuffer, width, height)
+        else:
+            glBindRenderbuffer(GL_RENDERBUFFER, self.color_renderbuffer)
+            glRenderbufferStorage(GL_RENDERBUFFER, GL_RGBA8, width, height)
 
-        glFramebufferRenderbuffer(
-            GL_FRAMEBUFFER,
-            GL_COLOR_ATTACHMENT0,
-            GL_RENDERBUFFER,
-            self.color_renderbuffer)
+            glFramebufferRenderbuffer(
+                GL_FRAMEBUFFER,
+                GL_COLOR_ATTACHMENT0,
+                GL_RENDERBUFFER,
+                self.color_renderbuffer)
 
         if renpy.config.depth_size:
 
@@ -800,14 +858,17 @@ cdef class GL2Draw:
         # 1px fbo.
         self.change_fbo(self.fbo_1px)
 
-        glBindRenderbuffer(GL_RENDERBUFFER, self.color_renderbuffer_1px)
-        glRenderbufferStorage(GL_RENDERBUFFER, GL_RGBA8,  1, 1)
+        if renpy.vita:
+            self.color_renderbuffer_1px = vita_color_texture(self.color_renderbuffer_1px, 1, 1)
+        else:
+            glBindRenderbuffer(GL_RENDERBUFFER, self.color_renderbuffer_1px)
+            glRenderbufferStorage(GL_RENDERBUFFER, GL_RGBA8,  1, 1)
 
-        glFramebufferRenderbuffer(
-            GL_FRAMEBUFFER,
-            GL_COLOR_ATTACHMENT0,
-            GL_RENDERBUFFER,
-            self.color_renderbuffer_1px)
+            glFramebufferRenderbuffer(
+                GL_FRAMEBUFFER,
+                GL_COLOR_ATTACHMENT0,
+                GL_RENDERBUFFER,
+                self.color_renderbuffer_1px)
 
         if renpy.config.depth_size:
 
@@ -838,14 +899,22 @@ cdef class GL2Draw:
 
         # Full-size fbo.
         glDeleteFramebuffers(1, &self.fbo)
-        glDeleteRenderbuffers(1, &self.color_renderbuffer)
+
+        if renpy.vita:
+            glDeleteTextures(1, &self.color_renderbuffer)
+        else:
+            glDeleteRenderbuffers(1, &self.color_renderbuffer)
 
         if renpy.config.depth_size:
             glDeleteRenderbuffers(1, &self.depth_renderbuffer)
 
         # 1px fbo.
         glDeleteFramebuffers(1, &self.fbo_1px)
-        glDeleteRenderbuffers(1, &self.color_renderbuffer_1px)
+
+        if renpy.vita:
+            glDeleteTextures(1, &self.color_renderbuffer_1px)
+        else:
+            glDeleteRenderbuffers(1, &self.color_renderbuffer_1px)
 
         if renpy.config.depth_size:
             glDeleteRenderbuffers(1, &self.depth_renderbuffer_1px)
@@ -859,7 +928,7 @@ cdef class GL2Draw:
 
         powersave = renpy.game.preferences.gl_powersave
 
-        if not powersave:
+        if renpy.vita or not powersave:
             return False
 
         return not self.fast_redraw_frames
@@ -1023,6 +1092,9 @@ cdef class GL2Draw:
         if flip:
             self.flip()
             self.texture_loader.cleanup()
+
+            if renpy.vita:
+                renpy.gl2.gl2texture.vita_rtt_next_frame()
 
     def load_all_textures(self, what):
         """
@@ -1214,6 +1286,7 @@ cdef class GL2Draw:
         cdef unsigned char *raw_pixels
         cdef unsigned char *rpp
         cdef int x, y, pitch
+        cdef int read_w
 
         if render_tree is not None:
             sw = render_tree.width * self.draw_per_virt
@@ -1224,23 +1297,44 @@ cdef class GL2Draw:
         full = renpy.display.pgrender.surface_unscaled((sw, sh), True)
         surf = PySurface_AsSurface(full)
 
+        read_w = surf.w
+
         # Create an array that can hold densely-packed pixels.
-        raw_pixels = <unsigned char *> malloc(surf.w * surf.h * 4)
+        raw_pixels = <unsigned char *> malloc(read_w * surf.h * 4)
+
+        # The Vita's offset of the image in the framebuffer read.
+        read_x = 0
+        read_y = 0
 
         # Draw the last screen to the back buffer.
-        if render_tree is not None:
+        if render_tree is not None and renpy.vita:
+            # On the Vita, drawing into the framebuffer object came out as
+            # garbage, while the on-screen path works: draw there, without
+            # a flip, and read it back (the next frame draws over it).
+            self.draw_screen(render_tree, flip=False, screenshot=False)
+            glFinish()
+            read_x = int(self.drawable_viewport[0])
+            read_y = int(self.drawable_viewport[1])
+        elif render_tree is not None:
             self.draw_screen(render_tree, flip=False, screenshot=True)
             glFinish()
 
-        # Read the pixels.
-        glReadPixels(
-            0,
-            0,
-            surf.w,
-            surf.h,
-            GL_RGBA,
-            GL_UNSIGNED_BYTE,
-            raw_pixels)
+        # Read the pixels. On the Vita, a row at a time: whole-image reads
+        # from the framebuffer object came back sheared (rows packed with a
+        # stride other than the width asked for).
+        if renpy.vita:
+            glPixelStorei(GL_PACK_ALIGNMENT, 4)
+            for y from 0 <= y < surf.h:
+                glReadPixels(read_x, read_y + y, surf.w, 1, GL_RGBA, GL_UNSIGNED_BYTE, raw_pixels + y * surf.w * 4)
+        else:
+            glReadPixels(
+                0,
+                0,
+                read_w,
+                surf.h,
+                GL_RGBA,
+                GL_UNSIGNED_BYTE,
+                raw_pixels)
 
         # Copy the pixels from raw_pixels to the surface.
         pixels = <unsigned char *> surf.pixels
@@ -1271,7 +1365,7 @@ cdef class GL2Draw:
                     pixels[x * 4 + 3] = a
 
                 pixels += pitch
-                rpp += surf.w * 4
+                rpp += read_w * 4
 
         free(raw_pixels)
 

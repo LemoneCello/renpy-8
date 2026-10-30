@@ -251,6 +251,181 @@ cdef class TextureLoader:
 
         return False
 
+# Render-to-texture targets on the Vita. gl2 renders a texture by drawing
+# into its framebuffer object's renderbuffer and copying the result into a
+# texture made for it. On the Vita's GPU, making a 960x540 texture costs ~28
+# ms and the copy and first use as much again, so a dissolve's two
+# full-screen renders cost ~150 ms in its first frame. Rendering straight into
+# a texture attached to its own framebuffer avoids both, but the PVR driver
+# keeps a large allocation for every texture that has ever been attached to a
+# framebuffer and fails after about seven. So a few screen-sized textures,
+# each with its own framebuffer, are made once and reused: a texture rendered
+# into one holds it until the Texture object is freed. Other sizes, and
+# requests when every target is in use, take gl2's usual path.
+
+# Each entry is a list: [ texture, framebuffer, width, height, in use,
+# frame it was released in ].
+cdef list vita_rtt_targets = [ ]
+
+# Frames drawn (GL2Draw.draw_screen). A released target is reused only two
+# frames later: the GPU runs a frame or two behind, and rendering into a
+# texture a queued frame still reads makes the driver wait for it.
+cdef int vita_rtt_frame = 0
+
+# Diagnostics: render-to-texture counts since the last vita_rtt_take_stats().
+vita_rtt_stats = { "renders" : 0, "pooled" : 0, "ms" : 0.0, "sizes" : { } }
+
+def vita_rtt_take_stats():
+    global vita_rtt_stats
+    rv = vita_rtt_stats
+    vita_rtt_stats = { "renders" : 0, "pooled" : 0, "ms" : 0.0, "sizes" : { } }
+    return rv
+
+def vita_rtt_next_frame():
+    global vita_rtt_frame
+    vita_rtt_frame += 1
+
+# The texture numbers of the targets.
+cdef set vita_rtt_numbers = set()
+
+# The loader the targets were made for (a new one means a new GL context).
+cdef object vita_rtt_loader = None
+
+# The size targets are made for (the drawable screen), or None to make none
+# (after a framebuffer turned out incomplete).
+cdef object vita_rtt_size = None
+
+VITA_RTT_TARGETS = 5
+
+# Frames a released target rests before it's reused (see vita_rtt_frame).
+VITA_RTT_HOLD = 1
+
+
+def vita_rtt_prepare(TextureLoader loader):
+    """
+    Makes the render targets, right after GL is set up (GL2Draw.on_resize):
+    made later, once movies and images hold the driver's memory, the
+    framebuffers come out incomplete.
+    """
+
+    global vita_rtt_loader, vita_rtt_size, vita_rtt_targets, vita_rtt_numbers
+
+    cdef GL2Draw draw = loader.draw
+
+    vita_rtt_loader = loader
+    vita_rtt_targets = [ ]
+    vita_rtt_numbers = set()
+    vita_rtt_size = (round(draw.drawable_viewport[2]), round(draw.drawable_viewport[3]))
+
+    for _i in range(VITA_RTT_TARGETS):
+        if vita_rtt_make(loader) is None:
+            break
+
+    for t in vita_rtt_targets:
+        t[4] = False
+
+    draw.change_fbo(draw.default_fbo)
+
+    renpy.display.log.write("Vita render targets: %d of %r", len(vita_rtt_targets), vita_rtt_size)
+
+
+cdef object vita_rtt_target(TextureLoader loader, int tw, int th):
+    """
+    Returns a free render target of `tw` x `th`, bound as the framebuffer
+    and marked as in use, or None.
+    """
+
+    cdef GL2Draw draw = loader.draw
+
+    if vita_rtt_loader is not loader or vita_rtt_size != (tw, th):
+        return None
+
+    for t in vita_rtt_targets:
+        if not t[4] and vita_rtt_frame - t[5] >= VITA_RTT_HOLD:
+            t[4] = True
+            draw.change_fbo(t[1])
+            return t
+
+    return None
+
+
+cdef object vita_rtt_make(TextureLoader loader):
+    """
+    Makes one render target, bound as the framebuffer and marked as in use.
+    """
+
+    global vita_rtt_size
+
+    cdef GLuint tex
+    cdef GLuint fbo
+    cdef GL2Draw draw = loader.draw
+    cdef int tw = vita_rtt_size[0]
+    cdef int th = vita_rtt_size[1]
+
+    glGenTextures(1, &tex)
+    glBindTexture(GL_TEXTURE_2D, tex)
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, tw, th, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL)
+    error = glGetError()
+
+    glGenFramebuffers(1, &fbo)
+    draw.change_fbo(fbo)
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0)
+
+    status = glCheckFramebufferStatus(GL_FRAMEBUFFER)
+
+    if status != GL_FRAMEBUFFER_COMPLETE:
+        renpy.display.log.write("Vita render target: framebuffer status 0x%x (glTexImage2D error 0x%x)", status, error)
+        draw.change_fbo(draw.default_fbo)
+        glDeleteFramebuffers(1, &fbo)
+        glDeleteTextures(1, &tex)
+        return None
+
+    t = [ tex, fbo, tw, th, True, -2 ]
+    vita_rtt_targets.append(t)
+    vita_rtt_numbers.add(tex)
+
+    return t
+
+
+cdef void vita_rtt_release(GLuint tex):
+    for t in vita_rtt_targets:
+        if t[0] == tex:
+            t[4] = False
+            t[5] = vita_rtt_frame
+
+
+cdef void upload_es2(SDL_Surface *s, int width, int height):
+    """
+    Uploads the RGBA pixels of `s` into the bound texture with OpenGL ES
+    2.0 alone (the Vita): no pixel buffer objects or GL_UNPACK_ROW_LENGTH,
+    so rows that aren't packed are copied together first.
+    """
+
+    cdef int row_bytes = width * 4
+    cdef unsigned char *packed
+    cdef unsigned char *src
+    cdef int y
+
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 4)
+
+    if s.pitch == row_bytes:
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, s.pixels)
+        return
+
+    packed = <unsigned char *> malloc(row_bytes * height)
+    src = <unsigned char *> s.pixels
+
+    for 0 <= y < height:
+        memcpy(packed + y * row_bytes, src + y * s.pitch, row_bytes)
+
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, packed)
+    free(packed)
+
+
 cdef class GLTexture(GL2Model):
     """
     This class represents an OpenGL texture that needs to be loaded by
@@ -320,6 +495,11 @@ cdef class GLTexture(GL2Model):
         self.surface = surface
         self.properties = properties
 
+        # On the Vita, images are already scaled for its screen (and the
+        # legacy renderer never had mipmaps), so don't make them by default.
+        if renpy.vita and "mipmap" not in properties:
+            self.properties = dict(properties, mipmap=False)
+
         self.mesh = Mesh2.texture_rectangle(
             0.0, 0.0, self.width, self.height,
             0.0, 0.0, 1.0, 1.0,
@@ -333,7 +513,7 @@ cdef class GLTexture(GL2Model):
         """
 
         self.properties = {
-            "mipmap" : properties.get("mipmap", True),
+            "mipmap" : properties.get("mipmap", not renpy.vita),
             "pixel_perfect" : properties.get("pixel_perfect", False),
             }
 
@@ -374,16 +554,36 @@ cdef class GLTexture(GL2Model):
 
         cdef GLuint premultiplied
 
-        glGenTextures(1, &premultiplied)
+        # On the Vita, render straight into a target texture if one is free
+        # (see vita_rtt_target).
+        target = None
 
-        # Bind the framebuffer.
-        draw.change_fbo(draw.fbo)
+        if renpy.vita and not self.properties["mipmap"]:
+            target = vita_rtt_target(loader, tw, th)
+
+        if renpy.vita:
+            vita_rtt_stats["renders"] += 1
+            vita_rtt_stats["pooled"] += (target is not None)
+            vita_rtt_stats["sizes"][(tw, th)] = vita_rtt_stats["sizes"].get((tw, th), 0) + 1
+            start = time.perf_counter()
+
+        if target is None:
+            glGenTextures(1, &premultiplied)
+
+            # Bind the framebuffer.
+            draw.change_fbo(draw.fbo)
+        else:
+            premultiplied = target[0]
 
         # Project the child from virtual space to the screen space.
         cdef Matrix transform
         transform = Matrix.ctexture_projection(cw, ch)
 
-        self.allocate_texture(premultiplied, tw, th, properties)
+        if target is None:
+            self.allocate_texture(premultiplied, tw, th, properties)
+        else:
+            self.texture_width = tw
+            self.texture_height = th
 
         # Set up the viewport.
         glViewport(0, 0, tw, th)
@@ -399,6 +599,12 @@ cdef class GLTexture(GL2Model):
         context = renpy.gl2.gl2draw.GL2DrawingContext(draw, tw, th)
         context.draw(what, transform)
 
+        if target is not None:
+            self.number = premultiplied
+            self.loaded = True
+            vita_rtt_stats["ms"] += (time.perf_counter() - start) * 1000
+            return
+
         glBindTexture(GL_TEXTURE_2D, premultiplied)
         glCopyTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 0, 0, tw, th, 0)
 
@@ -408,6 +614,9 @@ cdef class GLTexture(GL2Model):
         self.loader.allocated.add(self.number)
 
         self.loaded = True
+
+        if renpy.vita:
+            vita_rtt_stats["ms"] += (time.perf_counter() - start) * 1000
 
 
     def __repr__(self):
@@ -458,7 +667,10 @@ cdef class GLTexture(GL2Model):
         # But it doesn't seem to work with ANGLE or emscripten, so we avoid using PBOs when
         # angle is in use.
 
-        if not renpy.emscripten and not draw.angle:
+        if renpy.vita:
+            upload_es2(s, self.width, self.height)
+
+        elif not renpy.emscripten and not draw.angle:
 
             glGenBuffers(1, &pixel_buffer)
             glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pixel_buffer)
@@ -541,7 +753,10 @@ cdef class GLTexture(GL2Model):
         # But it doesn't seem to work with ANGLE or emscripten, so we avoid using PBOs when
         # angle is in use.
 
-        if not renpy.emscripten and not draw.angle:
+        if renpy.vita:
+            upload_es2(s, self.width, self.height)
+
+        elif not renpy.emscripten and not draw.angle:
 
             glGenBuffers(1, &pixel_buffer)
             glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pixel_buffer)
@@ -560,6 +775,62 @@ cdef class GLTexture(GL2Model):
 
         # Store the loaded texture.
         self.number = premultiplied
+        self.loader.allocated.add(self.number)
+
+        self.loaded = True
+        self.surface = None
+
+    def load_gltexture_vita(GLTexture self):
+        """
+        Loads this texture on the Vita (OpenGL ES 2.0). gl2 normally
+        premultiplies alpha on the GPU, drawing the image into a framebuffer
+        and copying the result into a new texture, which costs ~145 ms for a
+        960x540 image on the Vita's GPU; premultiplying on the CPU (as the
+        legacy renderer does, ~24 ms) and uploading once is several times
+        faster. The premultiplied copy is packed, so GL_UNPACK_ROW_LENGTH
+        (not in ES 2.0) isn't needed either.
+        """
+
+        cdef GLuint tex
+        cdef const unsigned char *data
+
+        if self.loaded:
+            return
+
+        import renpy.gl.gltexture as gltexture
+
+        pixels = gltexture.premultiply(
+            self.surface, 0, 0, self.width, self.height,
+            False, False, False, False,
+            self.properties.get("premultiplied", False))
+
+        data = pixels
+
+        glGenTextures(1, &tex)
+        glActiveTexture(GL_TEXTURE0)
+        glBindTexture(GL_TEXTURE_2D, tex)
+
+        if self.has_mipmaps():
+            self.loader.total_texture_size += int(self.width * self.height * 4 * 1.34)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_NEAREST)
+        else:
+            self.loader.total_texture_size += int(self.width * self.height * 4)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
+
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
+
+        self.texture_width = self.width
+        self.texture_height = self.height
+
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 4)
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, self.width, self.height, 0, GL_RGBA, GL_UNSIGNED_BYTE, data)
+
+        if self.has_mipmaps():
+            glGenerateMipmap(GL_TEXTURE_2D)
+
+        self.number = tex
         self.loader.allocated.add(self.number)
 
         self.loaded = True
@@ -588,7 +859,8 @@ cdef class GLTexture(GL2Model):
         if not properties.get("mipmap", True):
             max_level = 0
 
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, max_level)
+        if not renpy.vita: # (not in OpenGL ES 2.0)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, max_level)
 
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
 
@@ -634,7 +906,8 @@ cdef class GLTexture(GL2Model):
             level = 0
 
         glBindTexture(GL_TEXTURE_2D, tex)
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, level)
+        if not renpy.vita: # (not in OpenGL ES 2.0)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, level)
 
         if level == 0:
             return
@@ -647,7 +920,13 @@ cdef class GLTexture(GL2Model):
 
     def __del__(self):
         try:
-            if self.loaded:
+            # A texture whose number the loader doesn't own (all textures
+            # were freed since, or texture_from_number) isn't deleted.
+            if self.loaded and self.number in vita_rtt_numbers:
+                vita_rtt_release(self.number)
+                return
+
+            if self.loaded and self.number in self.loader.allocated:
                 self.loader.free_list.append(self.number)
 
                 if self.has_mipmaps():
@@ -659,7 +938,9 @@ cdef class GLTexture(GL2Model):
 
     def load(self):
 
-        if self.properties.get("premultiplied", False):
+        if renpy.vita:
+            self.load_gltexture_vita()
+        elif self.properties.get("premultiplied", False):
             self.load_gltexture_premultiplied()
         else:
             self.load_gltexture()
@@ -683,3 +964,32 @@ class Texture(GLTexture):
     """
 
     pass
+
+
+def texture_from_number(unsigned int number, int width, int height, int texture_width=0, int texture_height=0):
+    """
+    Wraps an existing GL texture, `width` by `height`, in a Texture. Ren'Py
+    doesn't own the texture: it's never freed or deleted here, and whoever
+    made it may keep changing its contents. Used for the Vita's zero-copy
+    video frames. If the GL texture is larger (`texture_width` by
+    `texture_height`), the image is its top-left corner.
+    """
+
+    if texture_width <= 0:
+        texture_width = width
+    if texture_height <= 0:
+        texture_height = height
+
+    cdef GLTexture rv = Texture((width, height), renpy.display.draw.texture_loader)
+
+    rv.number = number
+    rv.loaded = True
+    rv.texture_width = texture_width
+    rv.texture_height = texture_height
+    rv.properties = { "mipmap" : False }
+    rv.mesh = Mesh2.texture_rectangle(
+        0.0, 0.0, width, height,
+        0.0, 0.0, 1.0 * width / texture_width, 1.0 * height / texture_height,
+        )
+
+    return rv
