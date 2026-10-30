@@ -538,6 +538,12 @@ def load_from_filesystem(name):
 file_open_callbacks.append(load_from_filesystem)
 
 
+# Archive entries up to this size are read in one go on the PS Vita, unless
+# their names end with one of streamed_extensions.
+whole_read_limit = 4 * 1024 * 1024
+streamed_extensions = (".ogg", ".opus", ".mp3", ".wav", ".flac", ".mp2", ".mp4", ".webm", ".ogv", ".mkv", ".avi", ".mpg", ".mpeg")
+
+
 def load_from_archive(name):
     """
     Returns an open python file object of the given type from an archive file.
@@ -561,6 +567,19 @@ def load_from_archive(name):
                 offset, dlen, start = t
 
             if start == None or len(start) == 0:
+
+                # On the PS Vita every read goes to the memory card
+                # (sceIoRead, ~2 ms each); BufferedReader's 8 KB reads made
+                # a 330 KB image take 92 ms to read, one read 36 ms. Audio
+                # and video stream, so they keep the buffered reader.
+                if renpy.vita and dlen <= whole_read_limit and not name.lower().endswith(streamed_extensions):
+                    with open(afn, "rb", buffering=0) as f:
+                        f.seek(offset)
+                        data = f.read(dlen)
+
+                    if len(data) == dlen:
+                        return io.BufferedReader(RWopsIO.from_buffer(data, name=name))
+
                 rv = RWopsIO(afn, "rb", base=offset, length=dlen)
                 return io.BufferedReader(rv)
             else:
