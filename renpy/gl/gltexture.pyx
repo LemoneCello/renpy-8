@@ -33,6 +33,11 @@ import_pygame_sdl2()
 from cpython.bytes cimport PyBytes_FromStringAndSize
 from libc.stdlib cimport calloc, free
 
+cdef extern from *:
+    # Reads of image data are latency bound on the PS Vita (~100 MB/s
+    # without prefetching); premultiply fetches a few cache lines ahead.
+    void __builtin_prefetch(const void *addr) nogil
+
 import sys
 import time
 import collections
@@ -1305,6 +1310,7 @@ def premultiply(
             if premultiplied:
 
                 while p < pend:
+                    __builtin_prefetch(p + 256)
                     op[0] = p[0]
                     op[1] = p[1]
                     op[2] = p[2]
@@ -1321,6 +1327,7 @@ def premultiply(
 
                     while p < pend:
 
+                        __builtin_prefetch(p + 256)
                         a = p[3]
 
                         op[0] = (p[0] * a + a) >> 8
@@ -1335,6 +1342,7 @@ def premultiply(
 
                     while p < pend:
 
+                        __builtin_prefetch(p + 256)
                         (<unsigned int *> op)[0] = (<unsigned int *> p)[0]
                         op[3] = 255
 

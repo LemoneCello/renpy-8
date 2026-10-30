@@ -1611,6 +1611,9 @@ void colormatrix32_core(PyObject *pysrc, PyObject *pydst,
 
             if (dpe - dp >= 16) {
                 unsigned int q[4];
+                /* Reads are latency bound on the PS Vita without this
+                   (~100 MB/s); fetch a few cache lines ahead. */
+                __builtin_prefetch(sp + 256);
                 memcpy(q, sp, 16);
                 if ((q[0] | q[1] | q[2] | q[3]) == 0) {
                     memcpy(dp, zero_block, 16);
