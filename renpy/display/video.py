@@ -24,6 +24,8 @@ from renpy.compat import PY2, basestring, bchr, bord, chr, open, pystr, range, r
 
 import collections
 import re
+import time
+import weakref
 
 import renpy
 
@@ -120,6 +122,95 @@ def rollback():
         rollback_state = "pending"
 
 
+# Vita: Movie images all play on the one "movie" channel (see Movie), so when
+# a movie is shown over another (e.g. `show b with dissolve` over a shown
+# `a`), the channel switches to the new movie and both would draw its frames:
+# a dissolve between them showed as a cut, and when the top one was hidden,
+# the lower one restarted and showed nothing until its first frame. Instead,
+# a movie that loses the channel keeps a copy of its last frame and draws
+# that while it doesn't have the channel, and also after it gets the channel
+# back, until a frame of its own arrives.
+
+# The number of new frames each channel has produced.
+frame_serial = collections.defaultdict(int)
+
+# id(Movie) -> [ weakref to the Movie, frozen texture, time last drawn ]
+frozen_frames = { }
+
+# id(Movie) -> the channel's frame_serial when the Movie last got its channel.
+started_serial = { }
+
+
+def freeze_frame(movie, channel):
+    """
+    Copies the channel's current frame for `movie`, which is losing the
+    channel.
+    """
+
+    tex = texture.get(channel, None)
+    draw = renpy.display.draw
+
+    if (tex is None) or (draw is None):
+        return
+
+    # Rendered at the drawable resolution, the copy has the frame's size in
+    # pixels, so it stands in for the frame texture unchanged.
+    w, h = tex.get_size()
+    scale = draw.draw_per_virt
+    r = resize_movie(tex, w / scale, h / scale)
+    copy = draw.render_to_texture(r, False)
+    r.kill()
+
+    frozen_frames[id(movie)] = [ weakref.ref(movie), copy, time.time() ]
+
+
+def switch_channel(channel, old, new):
+    """
+    Called before `new` starts playing on `channel` in place of `old`.
+    """
+
+    if (old is not None) and (old is not new) and (old._play is not None):
+        freeze_frame(old, channel)
+
+    started_serial[id(new)] = frame_serial[channel]
+
+    # Frozen frames not drawn for a while belong to movies no longer shown.
+    now = time.time()
+
+    for k, v in list(frozen_frames.items()):
+        if (v[0]() is None) or (now - v[2] > 2.0):
+            del frozen_frames[k]
+
+
+def frozen_texture(movie):
+    """
+    Returns the texture `movie` should draw instead of its channel's frames,
+    or None to draw them.
+    """
+
+    entry = frozen_frames.get(id(movie), None)
+
+    if entry is None:
+        return None
+
+    if entry[0]() is not movie:
+        del frozen_frames[id(movie)]
+        return None
+
+    channel = movie.channel
+
+    if last_channel_movie.get(channel, None) is movie:
+        # Reads the channel, counting a new frame if there is one.
+        get_movie_texture(channel, movie.mask_channel, movie.side_mask, movie.style.mipmap)
+
+        if (channel in texture) and (frame_serial[channel] > started_serial.get(id(movie), frame_serial[channel])):
+            del frozen_frames[id(movie)]
+            return None
+
+    entry[2] = time.time()
+    return entry[1]
+
+
 def early_interact():
     """
     Called early in the interact process, to clear out the fullscreen
@@ -188,6 +279,7 @@ def get_movie_texture(channel, mask_channel=None, side_mask=False, mipmap=None):
 
         if tex is not None:
             texture[channel] = tex
+            frame_serial[channel] += 1
             return tex, True
 
         return texture.get(channel, None), False
@@ -225,6 +317,7 @@ def get_movie_texture(channel, mask_channel=None, side_mask=False, mipmap=None):
         renpy.display.render.mutated_surface(surf)
         tex = renpy.display.draw.load_texture(surf, True, { "mipmap" : mipmap })
         texture[channel] = tex
+        frame_serial[channel] += 1
         new = True
     else:
         tex = texture.get(channel, None)
@@ -594,6 +687,20 @@ class Movie(renpy.display.displayable.Displayable):
             if channel_movie.get(self.channel, None) is not self:
                 channel_movie[self.channel] = self
 
+        if renpy.vita:
+            tex = frozen_texture(self)
+
+            if tex is not None:
+                w, h = tex.get_size()
+                rv = renpy.display.render.Render(w, h)
+                rv.blit(tex, (0, 0))
+
+                if self.size is not None:
+                    rv = resize_movie(rv, self.size[0], self.size[1])
+
+                renpy.display.render.redraw(self, 0.1)
+                return rv
+
         playing = renpy.audio.music.get_playing(self.channel)
 
         not_playing = not playing
@@ -730,10 +837,16 @@ def update_playing():
         last = last_channel_movie.get(c, None)
 
         if (c in reset_channels) and renpy.config.replay_movie_sprites:
+            if renpy.vita:
+                switch_channel(c, old if old is not None else last, m)
             m.play(old)
         elif old is not m:
+            if renpy.vita:
+                switch_channel(c, old if old is not None else last, m)
             m.play(old)
         elif m.loop and last is not m:
+            if renpy.vita:
+                switch_channel(c, last, m)
             m.play(last)
 
     for c, m in last_channel_movie.items():
