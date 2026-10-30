@@ -52,6 +52,7 @@ typedef struct {
     volatile int threads_started;  /* set at READY */
     volatile int audio_running;
     volatile int closed;
+    volatile int closing;          /* set under frame_mutex before close */
     int looping;                   /* loop until stopped */
     int looping_set;               /* sceAvPlayerSetLooping called */
 } MoviePlayer;
@@ -98,6 +99,9 @@ static char zero_copy_msg[256] = "";
 static uint64_t last_zero_copy_ts = (uint64_t) -1;
 static int zero_copy_frames = 0;
 static int zero_copy_misses = 0;
+
+/* Diagnostics (video_debug): AvPlayer events and data seen. */
+static int dbg_events = 0, dbg_last_event = -1, dbg_audio_frames = 0, dbg_audio_empty = 0, dbg_video_none = 0;
 
 #define ALLOC_LOG_SIZE 16
 static struct {
@@ -150,6 +154,13 @@ static void close_player(MoviePlayer *mp) {
     for (int i = 0; i < 100 && mp->audio_running; i++) {
         sceKernelDelayThread(10000);
     }
+
+    // The main thread reads frames (video_read_texture) under frame_mutex;
+    // once this is set it no longer touches the player, which is about to be
+    // closed (reading a closing player crashed in the GPU driver).
+    SDL_LockMutex(frame_mutex);
+    mp->closing = 1;
+    SDL_UnlockMutex(frame_mutex);
 
     sceAvPlayerStop(mp->handle);
     sceAvPlayerClose(mp->handle);
@@ -257,10 +268,12 @@ int movie_audio_thread(void *data) {
 
     while (player_current(mp) && sceAvPlayerIsActive(mp->handle)) {
         if (sceAvPlayerGetAudioData(mp->handle, &frame)) {
+            dbg_audio_frames++;
             sceAudioOutSetConfig(audio_port, 1024, frame.details.audio.sampleRate,
                     frame.details.audio.channelCount == 1 ? SCE_AUDIO_OUT_MODE_MONO : SCE_AUDIO_OUT_MODE_STEREO);
             sceAudioOutOutput(audio_port, frame.pData);
         } else {
+            dbg_audio_empty++;
             sceAudioOutOutput(audio_port, noSound);
         }
     }
@@ -343,6 +356,8 @@ int RPVITA_video_get_playing() {
 static void event_callback(void *p, int32_t argEventId, int32_t argSourceId, void *argEventData) {
     MoviePlayer *mp = (MoviePlayer *) p;
     printf("Player Event: %d\n", argEventId);
+    dbg_events++;
+    dbg_last_event = argEventId;
 
     if (argEventId == SCE_AVPLAYER_STATE_READY) {
         SceAvPlayerStreamInfo info;
@@ -531,6 +546,18 @@ static GLuint zc_target = 0;
 static int zc_target_width = 0;
 static int zc_target_height = 0;
 
+/*
+ * The conversion target is made once, at least screen-sized, when the frame
+ * pool is made (first interaction, outside any rendering); each frame is drawn
+ * into its top-left width x height. Made lazily on a movie's first frame it
+ * was attached to a framebuffer mid-render (e.g. inside a Dissolve's render
+ * to texture), and in a full game that failed (no frames shown, the movie
+ * "waiting") or crashed the driver: the PVR driver tolerates only a few
+ * textures that have been framebuffer attachments (see rpy/vita_fbo_rtt.rpy).
+ */
+#define ZC_TARGET_MIN_WIDTH 960
+#define ZC_TARGET_MIN_HEIGHT 544
+
 static GLuint zc_compile(GLenum kind, const char *source) {
     GLuint shader = glCreateShader(kind);
     GLint ok = 0;
@@ -575,8 +602,13 @@ static int zc_setup(int width, int height) {
         glGenFramebuffers(1, &zc_fbo);
     }
 
-    if (zc_target_width != width || zc_target_height != height) {
+    if (zc_target_width < width || zc_target_height < height) {
         GLint old_framebuffer = 0;
+
+        if (width < zc_target_width) width = zc_target_width;
+        if (height < zc_target_height) height = zc_target_height;
+        if (width < ZC_TARGET_MIN_WIDTH) width = ZC_TARGET_MIN_WIDTH;
+        if (height < ZC_TARGET_MIN_HEIGHT) height = ZC_TARGET_MIN_HEIGHT;
 
         if (zc_target) {
             glDeleteTextures(1, &zc_target);
@@ -679,6 +711,10 @@ int RPVITA_video_prepare() {
                 break;
             }
         }
+
+        if (frame_pool_state == 1 && zc_setup(ZC_TARGET_MIN_WIDTH, ZC_TARGET_MIN_HEIGHT)) {
+            frame_pool_state = -1;
+        }
     }
 
     return frame_pool_state;
@@ -695,43 +731,51 @@ int RPVITA_video_zero_copy() {
  */
 PyObject *RPVITA_video_read_texture() {
     SceAvPlayerFrameInfo info;
+    int width = 0, height = 0;
+    int converted = 0;
 
-    if (!zero_copy || player_state != PLAYER_ACTIVE || !sceAvPlayerIsActive(movie_player)) {
+    if (!zero_copy) {
         Py_RETURN_NONE;
     }
 
-    if (!sceAvPlayerGetVideoData(movie_player, &info) || info.timeStamp == last_zero_copy_ts) {
-        Py_RETURN_NONE;
-    }
+    // Held throughout, so close_player can't close the player meanwhile.
+    SDL_LockMutex(frame_mutex);
 
-    int width = info.details.video.width;
-    int height = info.details.video.height;
+    MoviePlayer *mp = current_player;
 
-    VitaPixmap *block = NULL;
-    for (int i = 0; i < FRAME_POOL_SIZE; i++) {
-        if (info.pData >= frame_pool[i].base && info.pData + width * height * 3 / 2 <= frame_pool[i].base + frame_pool[i].size) {
-            block = &frame_pool[i];
+    if (mp && !mp->closing && player_state == PLAYER_ACTIVE && sceAvPlayerIsActive(mp->handle)) {
+        if (!sceAvPlayerGetVideoData(mp->handle, &info)) {
+            dbg_video_none++;
+        } else if (info.timeStamp != last_zero_copy_ts) {
+            width = info.details.video.width;
+            height = info.details.video.height;
+
+            VitaPixmap *block = NULL;
+            for (int i = 0; i < FRAME_POOL_SIZE; i++) {
+                if (info.pData >= frame_pool[i].base && info.pData + width * height * 3 / 2 <= frame_pool[i].base + frame_pool[i].size) {
+                    block = &frame_pool[i];
+                }
+            }
+
+            if (!block) {
+                zero_copy_misses++;
+            } else if (!zc_setup(width, height)) {
+                zc_convert(block, info.pData, width, height);
+                last_zero_copy_ts = info.timeStamp;
+                zero_copy_frames++;
+                start_looping(mp);
+                converted = 1;
+            }
         }
     }
 
-    if (!block) {
-        zero_copy_misses++;
-        Py_RETURN_NONE;
-    }
-
-    if (zc_setup(width, height)) {
-        Py_RETURN_NONE;
-    }
-
-    zc_convert(block, info.pData, width, height);
-    last_zero_copy_ts = info.timeStamp;
-    zero_copy_frames++;
-
-    SDL_LockMutex(frame_mutex);
-    start_looping(current_player);
     SDL_UnlockMutex(frame_mutex);
 
-    return Py_BuildValue("(iii)", (int) zc_target, width, height);
+    if (!converted) {
+        Py_RETURN_NONE;
+    }
+
+    return Py_BuildValue("(iiiii)", (int) zc_target, width, height, zc_target_width, zc_target_height);
 }
 
 /* Diagnostics: zero-copy state and AvPlayer's frame allocations. */
@@ -742,8 +786,17 @@ PyObject *RPVITA_video_debug() {
         PyList_Append(allocs, t);
         Py_DECREF(t);
     }
-    return Py_BuildValue("{s:i,s:i,s:i,s:i,s:s,s:N}",
+    long long avtime = -1;
+    SDL_LockMutex(frame_mutex);
+    if (current_player && !current_player->closing && player_state == PLAYER_ACTIVE) {
+        avtime = (long long) sceAvPlayerCurrentTime(current_player->handle);
+    }
+    SDL_UnlockMutex(frame_mutex);
+    return Py_BuildValue("{s:i,s:i,s:i,s:i,s:s,s:N,s:i,s:i,s:i,s:i,s:i,s:L,s:i}",
         "pool_state", frame_pool_state, "zero_copy", zero_copy,
         "frames", zero_copy_frames, "misses", zero_copy_misses,
-        "msg", zero_copy_msg, "allocs", allocs);
+        "msg", zero_copy_msg, "allocs", allocs,
+        "events", dbg_events, "last_event", dbg_last_event,
+        "audio_frames", dbg_audio_frames, "audio_empty", dbg_audio_empty,
+        "video_none", dbg_video_none, "av_time", avtime, "player_state", player_state);
 }

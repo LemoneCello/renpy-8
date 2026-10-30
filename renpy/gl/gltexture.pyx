@@ -887,13 +887,19 @@ def compute_tiling(width, max_size, min_fill_factor):
     return row, tiles
 
 
-def texture_grid_from_number(unsigned int number, int width, int height):
+def texture_grid_from_number(unsigned int number, int width, int height, int texture_width=0, int texture_height=0):
     """
     Wraps an existing GL texture, `width` by `height`, in a TextureGrid of
     one tile. Ren'Py doesn't own the texture: it's never freed, reused or
     deleted here, and whoever made it may keep changing its contents. Used
-    for the Vita's zero-copy video frames.
+    for the Vita's zero-copy video frames. If the GL texture is larger
+    (`texture_width` by `texture_height`), the image is its top-left corner.
     """
+
+    if texture_width <= 0:
+        texture_width = width
+    if texture_height <= 0:
+        texture_height = height
 
     cdef TextureCore t = TextureCore(width, height)
 
@@ -901,8 +907,8 @@ def texture_grid_from_number(unsigned int number, int width, int height):
     t.format = tex_internalformat
     t.xadd = 0
     t.yadd = 0
-    t.xmul = 1.0 / width
-    t.ymul = 1.0 / height
+    t.xmul = 1.0 / texture_width
+    t.ymul = 1.0 / texture_height
 
     rv = TextureGrid(width, height)
     rv.columns = [ (0, width, 0) ]
