@@ -278,7 +278,18 @@ def walkdir(dir): # @ReservedAssignment
     if not os.path.exists(dir) and not renpy.config.developer:
         return rv
 
-    for i in os.listdir(dir):
+    # scandir, as entries can know whether they're directories without a
+    # stat each (on the PS Vita one costs ~4 ms).
+    def is_dir(entry):
+        try:
+            return entry.is_dir()
+        except OSError:
+            return False
+
+    with os.scandir(dir) as it:
+        entries = [ (entry.name, is_dir(entry)) for entry in it ]
+
+    for i, is_dir in entries:
         if i[0] == ".":
             continue
 
@@ -287,7 +298,7 @@ def walkdir(dir): # @ReservedAssignment
         except Exception:
             continue
 
-        if os.path.isdir(dir + "/" + i):
+        if is_dir:
             for fn in walkdir(dir + "/" + i):
                 rv.append(i + "/" + fn)
         else:
