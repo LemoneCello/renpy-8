@@ -261,6 +261,7 @@ name_blacklist = {
     "renpy.exports.sdl_dll",
     "renpy.sl2.slast.serial",
     "renpy.gl2.gl2draw.default_position",
+    "renpy.display.im.known_bounds",
     }
 
 class Backup(_object):
