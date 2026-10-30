@@ -36,8 +36,18 @@ import io
 import os.path
 import sys
 
+import weakref
+
 import pygame_sdl2
 import renpy
+
+# Surfaces whose visible bounds (x, y, w, h, enclosing every pixel with
+# nonzero alpha) are already known, so the cache needn't scan them for
+# optimize_texture_bounds. Filled by loaders that know them: a MatrixColor
+# that keeps transparent pixels transparent, or loaders that pad cropped
+# images back to their full size. (The scan cost 18-35 ms per 960x540 image
+# on the PS Vita.)
+known_bounds = weakref.WeakKeyDictionary()
 
 # This is an entry in the image cache.
 class CacheEntry(object):
@@ -309,7 +319,10 @@ class Cache(object):
             w, h = size = surf.get_size()
 
             if optimize_bounds:
-                bounds = tuple(surf.get_bounding_rect())
+                bounds = known_bounds.pop(surf, None)
+
+                if bounds is None:
+                    bounds = tuple(surf.get_bounding_rect())
                 bounds = expand_bounds(bounds, size, renpy.config.expand_texture_bounds)
 
                 if image.oversample > 1:
@@ -1450,6 +1463,15 @@ class MatrixColor(ImageBase):
         rv = renpy.display.pgrender.surface(surf.get_size(), True)
 
         renpy.display.module.colormatrix(surf, rv, self.matrix)
+
+        # If the alpha row ignores colour and has no positive offset,
+        # transparent pixels stay transparent, so the source's bounds still
+        # enclose everything visible.
+        m = self.matrix
+        if m[15] == 0 and m[16] == 0 and m[17] == 0 and m[19] <= 0:
+            ce = cache.cache.get(self.image, None)
+            if ce is not None and (ce.width, ce.height) == surf.get_size():
+                known_bounds[rv] = ce.bounds
 
         return rv
 
