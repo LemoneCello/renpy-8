@@ -2,6 +2,7 @@
 #include <SDL.h>
 
 int RPVITA_exit_process(int res);
+long long RPVITA_thread_cpu_us();
 
 /* Video Player */
 

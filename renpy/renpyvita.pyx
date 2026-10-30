@@ -1,5 +1,6 @@
 cdef extern from "renpy_vita.h":
     int RPVITA_exit_process(int res)
+    long long RPVITA_thread_cpu_us()
     void RPVITA_video_init()
     object RPVITA_video_read_video()
     void RPVITA_video_start(char *file)
@@ -17,6 +18,9 @@ cdef extern from "renpy_vita.h":
 
 def exit_process(res):
     RPVITA_exit_process(res)
+
+def thread_cpu_us():
+    return RPVITA_thread_cpu_us()
 
 def video_init():
     RPVITA_video_init()

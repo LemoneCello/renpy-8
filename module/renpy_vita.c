@@ -24,6 +24,17 @@ int RPVITA_exit_process(int res) {
     sceKernelExitProcess(res);
 }
 
+/* CPU time the calling thread has used, in microseconds (the Vita's Python
+   has no time.thread_time, and process_time is wall time there). */
+long long RPVITA_thread_cpu_us() {
+    SceKernelThreadInfo info;
+    info.size = sizeof(info);
+    if (sceKernelGetThreadInfo(sceKernelGetThreadId(), &info) < 0) {
+        return -1;
+    }
+    return (long long) info.runClocks;
+}
+
 /* Video Player */
 
 static void convert_nv12_to_rgba(uint8_t *, uint8_t *, int, int);
