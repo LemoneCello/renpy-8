@@ -1147,6 +1147,13 @@ mipmap_text = False
 # to such movies.
 vita_zero_copy_video = True
 
+# On the Vita, should movies play through the port's own player
+# (module/vita_hwvideo.c: the hardware H.264 decoder driven directly, up to
+# two movies at once, each Movie on its own channel as on other platforms)
+# rather than Sony's AvPlayer (one movie at a time)? Needs
+# vita_zero_copy_video; H.264/AAC MP4 up to 960x544.
+vita_hw_video = True
+
 # Should the screensaver be allowed?
 allow_screensaver = True
 

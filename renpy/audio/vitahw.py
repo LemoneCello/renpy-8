@@ -2,6 +2,31 @@ import renpy
 import renpy.renpyvita as renpyvita
 from renpy.audio.audio import MusicContext
 import sys
+import time
+
+
+# Whether the port's own player (module/vita_hwvideo.c) is used: it plays
+# up to two movies at once, each on its own channel as on PC, where Sony's
+# AvPlayer (one at a time, on the shared "movie" channel) couldn't. None
+# until checked.
+hw = None
+
+
+def hw_available():
+    """
+    True if movies play through the port's own player. Checked once; the
+    decoder library is set up then.
+    """
+
+    global hw
+
+    if hw is None:
+        hw = bool(renpy.config.vita_hw_video and renpy.config.vita_zero_copy_video and renpyvita.hwvideo_available())
+
+        if not hw and renpy.config.vita_hw_video:
+            print("Vita hardware video player not available:", renpyvita.hwvideo_debug(0))
+
+    return hw
 
 
 def prepare():
@@ -14,6 +39,9 @@ def prepare():
     if renpy.config.vita_zero_copy_video:
         renpyvita.video_set_zero_copy(True)
         renpyvita.video_prepare()
+
+        if hw_available():
+            renpyvita.hwvideo_prepare()
 
 
 class VitaVideoChannel(object):
@@ -48,6 +76,16 @@ class VitaVideoChannel(object):
         # A prefix and suffix that are used to create the full filenames.
         self.file_prefix = file_prefix
         self.file_suffix = file_suffix
+
+        # The port's own player for the playing file (0: none).
+        self.handle = 0
+
+        # When to try again after the player couldn't start a movie.
+        self.retry_time = 0
+
+        # The volume set by set_volume, and the one last given to the player.
+        self.chan_volume = 1.0
+        self.actual_volume = None
 
         if default_loop is None:
             # By default, should we loop the music?
@@ -102,6 +140,24 @@ class VitaVideoChannel(object):
 
         print("Playing", filename, real_filename)
 
+        if hw_available():
+            # A loop of one file loops in the player, without a gap.
+            loop = not self.queue and self.loop == [ name ]
+            self.close()
+            self.handle = renpyvita.hwvideo_open(filename, loop)
+            self.filename = name
+            self.actual_volume = None
+            self.update_volume()
+
+            if not self.handle:
+                # E.g. both players busy: try again in a second, not at
+                # every periodic pass.
+                print("Can't play", filename, renpyvita.hwvideo_debug(0))
+                self.retry_time = time.time() + 1.0
+                self.queue.insert(0, name)
+
+            return
+
         renpyvita.video_set_zero_copy(renpy.config.vita_zero_copy_video)
 
         # A loop of one file loops in the player, without a gap (as Ren'Py's
@@ -109,12 +165,38 @@ class VitaVideoChannel(object):
         renpyvita.video_set_looping(not self.queue and self.loop == [ name ])
         renpyvita.video_start(real_filename)
 
+    def close(self):
+        if self.handle:
+            renpyvita.hwvideo_close(self.handle)
+            self.handle = 0
+
     def stop(self):
-        renpyvita.video_stop()
+        if hw_available():
+            self.close()
+        else:
+            renpyvita.video_stop()
+
         self.filename = None
 
     def get_playing(self):
+        if hw_available():
+            return bool(self.handle) and renpyvita.hwvideo_playing(self.handle)
+
         return renpyvita.video_get_playing()
+
+    def update_volume(self):
+        if not self.handle:
+            return
+
+        prefs = renpy.game.preferences
+        vol = self.chan_volume * prefs.volumes.get(self.mixer, 1.0) * prefs.volumes.get("main", 1.0)
+
+        if prefs.mute.get(self.mixer, False):
+            vol = 0.0
+
+        if vol != self.actual_volume:
+            renpyvita.hwvideo_set_volume(self.handle, vol)
+            self.actual_volume = vol
 
     def periodic(self):
 
@@ -129,7 +211,15 @@ class VitaVideoChannel(object):
 
         renpyvita.periodic()
 
+        self.update_volume()
+
         if self.get_playing():
+            return
+
+        # A finished movie's player is closed before the next starts.
+        self.close()
+
+        if time.time() < self.retry_time:
             return
 
         if not self.queue and self.loop:
@@ -176,7 +266,7 @@ class VitaVideoChannel(object):
         self.loop = list(filenames) if loop else [ ]
 
     def set_volume(self, volume):
-        pass
+        self.chan_volume = volume
 
     def get_pos(self):
         pass
@@ -211,6 +301,9 @@ class VitaVideoChannel(object):
         frames come from read_video_texture rather than read_video.
         """
 
+        if hw_available():
+            return bool(self.handle)
+
         return renpyvita.video_zero_copy()
 
     def read_video_texture(self):
@@ -219,7 +312,10 @@ class VitaVideoChannel(object):
         converted, else None. Every frame goes into the same GL texture.
         """
 
-        r = renpyvita.video_read_texture()
+        if hw_available():
+            r = renpyvita.hwvideo_read_texture(self.handle) if self.handle else None
+        else:
+            r = renpyvita.video_read_texture()
 
         if r is None:
             return None

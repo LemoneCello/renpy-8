@@ -927,7 +927,7 @@ def register_channel(name,
     if name == "movie":
         movie = True
 
-    if renpy.vita and name == "movie":
+    if renpy.vita and (name == "movie" or (movie and renpy.audio.vitahw.hw_available())):
         c = VitaVideoChannel(name, default_loop=loop, file_prefix=file_prefix, file_suffix=file_suffix)
 
     else:

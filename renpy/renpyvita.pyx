@@ -1,6 +1,14 @@
 cdef extern from "renpy_vita.h":
     int RPVITA_exit_process(int res)
     long long RPVITA_thread_cpu_us()
+    int RPVITA_hwvideo_available()
+    int RPVITA_hwvideo_prepare()
+    int RPVITA_hwvideo_open(const char *path, int loop) nogil
+    void RPVITA_hwvideo_close(int handle) nogil
+    int RPVITA_hwvideo_playing(int handle)
+    void RPVITA_hwvideo_set_volume(int handle, double volume)
+    object RPVITA_hwvideo_read_texture(int handle)
+    object RPVITA_hwvideo_debug(int handle)
     void RPVITA_video_init()
     object RPVITA_video_read_video()
     void RPVITA_video_start(char *file)
@@ -21,6 +29,39 @@ def exit_process(res):
 
 def thread_cpu_us():
     return RPVITA_thread_cpu_us()
+
+# The port's own movie player (module/vita_hwvideo.c): several at once.
+
+def hwvideo_available():
+    return RPVITA_hwvideo_available()
+
+def hwvideo_prepare():
+    return RPVITA_hwvideo_prepare()
+
+def hwvideo_open(path, loop):
+    cdef bytes b = path.encode("utf-8") if isinstance(path, str) else path
+    cdef const char *c = b
+    cdef int rv
+    cdef int l = 1 if loop else 0
+    with nogil:
+        rv = RPVITA_hwvideo_open(c, l)
+    return rv
+
+def hwvideo_close(int handle):
+    with nogil:
+        RPVITA_hwvideo_close(handle)
+
+def hwvideo_playing(int handle):
+    return bool(RPVITA_hwvideo_playing(handle))
+
+def hwvideo_set_volume(int handle, double volume):
+    RPVITA_hwvideo_set_volume(handle, volume)
+
+def hwvideo_read_texture(int handle):
+    return RPVITA_hwvideo_read_texture(handle)
+
+def hwvideo_debug(int handle=0):
+    return RPVITA_hwvideo_debug(handle)
 
 def video_init():
     RPVITA_video_init()

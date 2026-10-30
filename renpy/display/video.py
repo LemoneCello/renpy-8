@@ -115,6 +115,18 @@ group_texture = { }
 rollback_state = None
 
 
+def vita_shared_channel():
+    """
+    True on the Vita when movies play through Sony's AvPlayer, which plays
+    one movie at a time: then only the "movie" channel can play video, and
+    Movie images share it, as before auto_movie_channel. With the port's own
+    player (renpy.audio.vitahw.hw_available), each Movie gets its own
+    channel, as on other platforms.
+    """
+
+    return renpy.vita and not renpy.audio.vitahw.hw_available()
+
+
 def rollback():
     global rollback_state
 
@@ -609,10 +621,7 @@ class Movie(renpy.display.displayable.Displayable):
 
         if channel == "movie" and play and renpy.config.single_movie_channel:
             channel = renpy.config.single_movie_channel
-        elif channel == "movie" and play and renpy.config.auto_movie_channel and not renpy.vita:
-            # (On the Vita only the "movie" channel can play video: it's the
-            # one VitaVideoChannel, backed by the single AvPlayer instance,
-            # so Movie images share it, as before auto_movie_channel.)
+        elif channel == "movie" and play and renpy.config.auto_movie_channel and not vita_shared_channel():
             channel = "_movie_{}".format(movie_channel_serial)
             movie_channel_serial += 1
 

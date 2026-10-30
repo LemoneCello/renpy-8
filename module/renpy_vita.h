@@ -4,6 +4,16 @@
 int RPVITA_exit_process(int res);
 long long RPVITA_thread_cpu_us();
 
+/* vita_hwvideo.c */
+int RPVITA_hwvideo_available(void);
+int RPVITA_hwvideo_prepare(void);
+int RPVITA_hwvideo_open(const char *path, int loop);
+void RPVITA_hwvideo_close(int handle);
+int RPVITA_hwvideo_playing(int handle);
+void RPVITA_hwvideo_set_volume(int handle, double volume);
+PyObject *RPVITA_hwvideo_read_texture(int handle);
+PyObject *RPVITA_hwvideo_debug(int handle);
+
 /* Video Player */
 
 void RPVITA_video_init();
