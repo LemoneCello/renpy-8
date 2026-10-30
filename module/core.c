@@ -4,6 +4,7 @@
 #include <pygame_sdl2/pygame_sdl2.h>
 #include <stdio.h>
 #include <math.h>
+#include <string.h>
 
 // Shows how to do this.
 #if SDL_BYTEORDER == SDL_BIG_ENDIAN
@@ -1579,6 +1580,13 @@ void colormatrix32_core(PyObject *pysrc, PyObject *pydst,
     int o2 = c24 * 255;
     int o3 = c34 * 255;
 
+    /* Pixels equal to the previous one get its result. Images often have
+       large areas of one value (transparent margins, flat colour), and the
+       float maths costs ~200 ns per pixel on the PS Vita. */
+    unsigned int last_in = 0;
+    unsigned int last_out = 0;
+    int have_last = 0;
+
     for (y = 0; y < dsth; y++) {
 
         int r;
@@ -1588,39 +1596,45 @@ void colormatrix32_core(PyObject *pysrc, PyObject *pydst,
         unsigned char *sp = srcpixels + srcpitch * y;
 
         while (dp < dpe) {
+            unsigned int in;
+            memcpy(&in, sp, 4);
+
+            if (have_last && in == last_in) {
+                memcpy(dp, &last_out, 4);
+                dp += 4;
+                sp += 4;
+                continue;
+            }
+
             unsigned char s0 = *sp++;
             unsigned char s1 = *sp++;
             unsigned char s2 = *sp++;
             unsigned char s3 = *sp++;
 
-/*             *dp++ = (unsigned char) */
-/*                 fminf(255, fmaxf(0, fmaf(s0, c00, fmaf(s1, c01, fmaf(s2, c02, fmaf(s3, c03, o0)))))); */
-/*             *dp++ = (unsigned char) */
-/*                 fminf(255, fmaxf(0, fmaf(s0, c10, fmaf(s1, c11, fmaf(s2, c12, fmaf(s3, c13, o1)))))); */
-/*             *dp++ = (unsigned char) */
-/*                 fminf(255, fmaxf(0, fmaf(s0, c20, fmaf(s1, c21, fmaf(s2, c22, fmaf(s3, c23, o2)))))); */
-/*             *dp++ = (unsigned char) */
-/*                 fminf(255, fmaxf(0, fmaf(s0, c30, fmaf(s1, c31, fmaf(s2, c32, fmaf(s3, c33, o3)))))); */
-
             r = o0 + (int) (c00 * s0 + c01 * s1 + c02 * s2 + c03 * s3);
             if (r < 0) r = 0;
             if (r > 255) r = 255;
-            *dp++ = r;
+            dp[0] = r;
 
             r = o1 + (int) (c10 * s0 + c11 * s1 + c12 * s2 + c13 * s3);
             if (r < 0) r = 0;
             if (r > 255) r = 255;
-            *dp++ = r;
+            dp[1] = r;
 
             r = o2 + (int) (c20 * s0 + c21 * s1 + c22 * s2 + c23 * s3);
             if (r < 0) r = 0;
             if (r > 255) r = 255;
-            *dp++ = r;
+            dp[2] = r;
 
             r = o3 + (int) (c30 * s0 + c31 * s1 + c32 * s2 + c33 * s3);
             if (r < 0) r = 0;
             if (r > 255) r = 255;
-            *dp++ = r;
+            dp[3] = r;
+
+            last_in = in;
+            memcpy(&last_out, dp, 4);
+            have_last = 1;
+            dp += 4;
         }
     }
 
