@@ -1587,6 +1587,17 @@ void colormatrix32_core(PyObject *pysrc, PyObject *pydst,
     unsigned int last_out = 0;
     int have_last = 0;
 
+    /* The result for an all-zero pixel, used for blocks of four of them
+       (transparent margins), which skip even the comparison per pixel. */
+    unsigned char zero_px[4];
+    int zo[4] = { o0, o1, o2, o3 };
+    for (int i = 0; i < 4; i++) {
+        zero_px[i] = zo[i] < 0 ? 0 : (zo[i] > 255 ? 255 : zo[i]);
+    }
+    unsigned int zero_out;
+    memcpy(&zero_out, zero_px, 4);
+    unsigned int zero_block[4] = { zero_out, zero_out, zero_out, zero_out };
+
     for (y = 0; y < dsth; y++) {
 
         int r;
@@ -1597,6 +1608,18 @@ void colormatrix32_core(PyObject *pysrc, PyObject *pydst,
 
         while (dp < dpe) {
             unsigned int in;
+
+            if (dpe - dp >= 16) {
+                unsigned int q[4];
+                memcpy(q, sp, 16);
+                if ((q[0] | q[1] | q[2] | q[3]) == 0) {
+                    memcpy(dp, zero_block, 16);
+                    dp += 16;
+                    sp += 16;
+                    continue;
+                }
+            }
+
             memcpy(&in, sp, 4);
 
             if (have_last && in == last_in) {
