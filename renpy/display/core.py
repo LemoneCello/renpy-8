@@ -1097,8 +1097,9 @@ class Interface(object):
         if renpy.config.mouse_focus_clickthrough:
             pygame.display.hint("SDL_MOUSE_FOCUS_CLICKTHROUGH", "1")
 
-        if not renpy.vita:
-            pygame.display.set_screensaver(renpy.config.allow_screensaver)
+        # (The Vita port used to skip this, which left SDL resetting the
+        # Vita's idle timers every frame, so it never dimmed or slept.)
+        pygame.display.set_screensaver(renpy.config.allow_screensaver)
 
         # Needed for Ubuntu Unity.
         wmclass = renpy.config.save_directory or os.path.basename(sys.argv[0])
