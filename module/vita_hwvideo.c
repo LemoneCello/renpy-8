@@ -10,14 +10,15 @@
  *
  * Per player: a demux thread reads packets; video access units go through
  * h264_mp4toannexb to the decoder, which writes NV12 pictures into a ring of
- * HW_RING slots inside one of the zero-copy frame pool pixmaps (GPU-visible,
- * see renpy_vita.c); audio is decoded, converted to 48 kHz stereo S16 and
+ * HW_RING slots in GPU-shared pixmaps (vita_pixmap.c), with rows HW_PITCH
+ * bytes apart so that a picture row is a texture row; audio is decoded,
+ * converted to 48 kHz stereo S16 and
  * queued for an audio thread that plays it on its own audio port. Playback
  * starts once the first picture and some audio are ready; the clock is the
  * sound that's playing (the wall clock for a movie without sound), and the
  * main thread (hwvideo_read_texture) shows the newest picture
- * that is due, converting it into the player's own RGBA texture with the
- * zero-copy shader. Looping seeks back to the start and keeps decoding, with
+ * that is due, converting it into the player's own RGBA texture with a
+ * shader (hw_convert). Looping seeks back to the start and keeps decoding, with
  * timestamps offset by the loop length, so a loop has no gap; audio is
  * placed by its timestamps, which keeps it in step across loops.
  *
@@ -44,7 +45,12 @@
 #include "vita_pixmap.h"
 
 #define HW_MAX 2
-#define HW_RING 4
+#define HW_RING 8                     /* at most; as many as fit the pool block */
+/* Pictures stay reserved for this many newer pictures after being shown:
+   the GPU runs a frame or two behind, and a slot handed back to the decoder
+   at once was overwritten while the GPU still converted it (blocks of the
+   next frame showing, most visibly in 60 fps movies). */
+#define HW_KEEP 2
 #define HW_MAX_WIDTH 960
 #define HW_MAX_HEIGHT 544
 #define HW_REFS 8
@@ -53,10 +59,14 @@
 #define HW_PCM_FRAMES (HW_RATE * 2)   /* queued audio, 2 s */
 #define HW_TS 90000                   /* decoder timestamp units */
 
-/* From renpy_vita.c. */
-void zc_convert_nv12(VitaPixmap *block, const uint8_t *y, const uint8_t *uv, int stride, int width, int height, GLuint fbo);
-int zc_make_target(int width, int height, GLuint *texture, GLuint *fbo, char *msg, size_t len);
-VitaPixmap *zc_pool_block(int i);
+/* Picture layout in the ring: rows HW_PITCH bytes apart (one row of a
+   HW_PITCH / 4 texel wide pixmap), luma rows then the interleaved chroma
+   rows; HW_SLOTS_PER_PIXMAP pictures per pixmap, HW_RING / that pixmaps per
+   player. */
+#define HW_PITCH 1024
+#define HW_SLOT_ROWS (HW_MAX_HEIGHT * 3 / 2)
+#define HW_SLOTS_PER_PIXMAP 4
+#define HW_PIXMAPS (HW_RING / HW_SLOTS_PER_PIXMAP)
 
 /* Not in VitaSDK's headers; as declared in wiliwili's FFmpeg patch
    (scripts/psv/ffmpeg/ffmpeg.patch, libavcodec/vitadec_video.c). */
@@ -112,11 +122,14 @@ typedef struct {
     SceUID frame_block;
     int decoder_ok;
 
-    VitaPixmap *ring;
+    int slots;                     /* ring slots in use */
+    VitaPixmap *slot_pixmap[HW_RING];
+    int slot_row[HW_RING];         /* first row of the picture in its pixmap */
     uint8_t *slot[HW_RING];
     int slot_state[HW_RING];
     int64_t slot_pts[HW_RING];
     int shown;
+    int recent[HW_KEEP];           /* previously shown, still reserved */
     int64_t shown_pts;
 
     volatile SceUInt64 t0;         /* clock start, 0 until started */
@@ -138,9 +151,179 @@ static SceUID lib_block = -1, lib_unmap = -1;
 static SceUIntVAddr lib_vaddr = 0;
 static SDL_mutex *open_lock = NULL;
 
-/* Per player index: the texture its frames are converted into. */
+/* GL objects, made on the main thread (hwvideo_prepare): per player index
+   its ring pixmaps and the texture its pictures are converted into. */
+static VitaPixmap pixmaps[HW_MAX][HW_PIXMAPS];
 static GLuint targets[HW_MAX], target_fbos[HW_MAX];
 static int targets_state = 0;      /* 0 not made, 1 ready, -1 failed */
+static GLuint program;
+static GLint u_tex, u_size, u_tex_size, u_y_row, u_uv_row;
+
+/* NV12 to RGB (BT.601, limited range). Output pixel (x, y) is picture pixel
+   (x, y), so texture row 0 is the top of the picture. With the ring layout,
+   picture row y is texture row u_y_row + y and its chroma row
+   u_uv_row + y / 2, and texel x / 4 of either holds bytes x..x+3 (B G R A
+   order: byte 0 is .b): both reads use coordinates interpolated from the
+   vertex shader, which the GPU does much faster than reads at addresses
+   computed per pixel (renpy_vita.c's shader for AvPlayer's frames). */
+static const char *vertex_shader =
+    "attribute vec2 a_position;\n"
+    "uniform vec2 u_size;\n"
+    "uniform vec2 u_tex_size;\n"
+    "uniform float u_y_row;\n"
+    "uniform float u_uv_row;\n"
+    "varying highp vec2 v_y;\n"
+    "varying highp vec2 v_uv;\n"
+    "varying highp float v_x;\n"
+    "void main() {\n"
+    "    vec2 p = (a_position * 0.5 + 0.5) * u_size;\n"
+    "    v_x = p.x;\n"
+    "    v_y = vec2(p.x / (u_tex_size.x * 4.0), (u_y_row + p.y) / u_tex_size.y);\n"
+    "    v_uv = vec2(p.x / (u_tex_size.x * 4.0), (u_uv_row + p.y * 0.5) / u_tex_size.y);\n"
+    "    gl_Position = vec4(a_position, 0.0, 1.0);\n"
+    "}\n";
+
+static const char *fragment_shader =
+    "precision highp float;\n"
+    "uniform sampler2D u_tex;\n"
+    "varying highp vec2 v_y;\n"
+    "varying highp vec2 v_uv;\n"
+    "varying highp float v_x;\n"
+    "void main() {\n"
+    "    vec4 ty = texture2D(u_tex, v_y);\n"
+    "    vec4 tc = texture2D(u_tex, v_uv);\n"
+    "    float k = floor(mod(v_x, 4.0));\n"
+    "    float y = (dot(ty, vec4(equal(vec4(k), vec4(2.0, 1.0, 0.0, 3.0)))) - 0.0625) * 1.164;\n"
+    "    float h = step(1.5, k);\n"
+    "    float u = mix(tc.b, tc.r, h) - 0.5;\n"
+    "    float v = mix(tc.g, tc.a, h) - 0.5;\n"
+    "    gl_FragColor = vec4(y + 1.596 * v, y - 0.391 * u - 0.813 * v, y + 2.018 * u, 1.0);\n"
+    "}\n";
+
+static GLuint compile(GLenum kind, const char *source) {
+    GLuint shader = glCreateShader(kind);
+    GLint ok = 0;
+    glShaderSource(shader, 1, &source, NULL);
+    glCompileShader(shader);
+    glGetShaderiv(shader, GL_COMPILE_STATUS, &ok);
+    if (!ok) {
+        char log[120] = "";
+        glGetShaderInfoLog(shader, sizeof(log), NULL, log);
+        snprintf(lib_msg, sizeof(lib_msg), "shader: %s", log);
+        return 0;
+    }
+    return shader;
+}
+
+static int gl_setup(void) {
+    GLuint vs = compile(GL_VERTEX_SHADER, vertex_shader);
+    GLuint fs = compile(GL_FRAGMENT_SHADER, fragment_shader);
+    GLint ok = 0;
+    if (!vs || !fs) {
+        return -1;
+    }
+    program = glCreateProgram();
+    glAttachShader(program, vs);
+    glAttachShader(program, fs);
+    glBindAttribLocation(program, 0, "a_position");
+    glLinkProgram(program);
+    glGetProgramiv(program, GL_LINK_STATUS, &ok);
+    if (!ok) {
+        snprintf(lib_msg, sizeof(lib_msg), "shader link failed");
+        return -1;
+    }
+    u_tex = glGetUniformLocation(program, "u_tex");
+    u_size = glGetUniformLocation(program, "u_size");
+    u_tex_size = glGetUniformLocation(program, "u_tex_size");
+    u_y_row = glGetUniformLocation(program, "u_y_row");
+    u_uv_row = glGetUniformLocation(program, "u_uv_row");
+
+    for (int i = 0; i < HW_MAX; i++) {
+        for (int j = 0; j < HW_PIXMAPS; j++) {
+            if (vita_pixmap_create(HW_PITCH / 4, HW_SLOT_ROWS * HW_SLOTS_PER_PIXMAP, 1, &pixmaps[i][j], lib_msg, sizeof(lib_msg))) {
+                return -1;
+            }
+        }
+
+        GLint old_framebuffer = 0;
+        glGenTextures(1, &targets[i]);
+        glBindTexture(GL_TEXTURE_2D, targets[i]);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, HW_MAX_WIDTH, HW_MAX_HEIGHT, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+        glBindTexture(GL_TEXTURE_2D, 0);
+        glGenFramebuffers(1, &target_fbos[i]);
+        glGetIntegerv(GL_FRAMEBUFFER_BINDING, &old_framebuffer);
+        glBindFramebuffer(GL_FRAMEBUFFER, target_fbos[i]);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, targets[i], 0);
+        GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+        glBindFramebuffer(GL_FRAMEBUFFER, old_framebuffer);
+        if (status != GL_FRAMEBUFFER_COMPLETE) {
+            snprintf(lib_msg, sizeof(lib_msg), "framebuffer status 0x%x", status);
+            return -1;
+        }
+    }
+    return 0;
+}
+
+/* Converts a ring picture into the player's texture, leaving the GL state
+   as it found it. */
+static void hw_convert(VitaPixmap *pm, int row, int coded_h, int width, int height, GLuint fbo) {
+    static const GLfloat quad[] = { -1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f, 1.0f, 1.0f };
+
+    GLint old_program, framebuffer, viewport[4], array_buffer, active_texture, texture;
+    GLint attrib_enabled, attrib_size, attrib_type, attrib_normalized, attrib_stride, attrib_buffer;
+    GLvoid *attrib_pointer;
+    GLboolean blend = glIsEnabled(GL_BLEND);
+    GLboolean scissor = glIsEnabled(GL_SCISSOR_TEST);
+
+    glGetIntegerv(GL_CURRENT_PROGRAM, &old_program);
+    glGetIntegerv(GL_FRAMEBUFFER_BINDING, &framebuffer);
+    glGetIntegerv(GL_VIEWPORT, viewport);
+    glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &array_buffer);
+    glGetIntegerv(GL_ACTIVE_TEXTURE, &active_texture);
+    glActiveTexture(GL_TEXTURE0);
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &texture);
+    glGetVertexAttribiv(0, GL_VERTEX_ATTRIB_ARRAY_ENABLED, &attrib_enabled);
+    glGetVertexAttribiv(0, GL_VERTEX_ATTRIB_ARRAY_SIZE, &attrib_size);
+    glGetVertexAttribiv(0, GL_VERTEX_ATTRIB_ARRAY_TYPE, &attrib_type);
+    glGetVertexAttribiv(0, GL_VERTEX_ATTRIB_ARRAY_NORMALIZED, &attrib_normalized);
+    glGetVertexAttribiv(0, GL_VERTEX_ATTRIB_ARRAY_STRIDE, &attrib_stride);
+    glGetVertexAttribiv(0, GL_VERTEX_ATTRIB_ARRAY_BUFFER_BINDING, &attrib_buffer);
+    glGetVertexAttribPointerv(0, GL_VERTEX_ATTRIB_ARRAY_POINTER, &attrib_pointer);
+
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    glViewport(0, 0, width, height);
+    glDisable(GL_BLEND);
+    glDisable(GL_SCISSOR_TEST);
+    glUseProgram(program);
+    glBindTexture(GL_TEXTURE_2D, pm->texture);
+    glUniform1i(u_tex, 0);
+    glUniform2f(u_size, (float) width, (float) height);
+    glUniform2f(u_tex_size, (float) pm->width, (float) pm->height);
+    glUniform1f(u_y_row, (float) row);
+    glUniform1f(u_uv_row, (float) (row + coded_h));
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, quad);
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+
+    glBindBuffer(GL_ARRAY_BUFFER, attrib_buffer);
+    glVertexAttribPointer(0, attrib_size, attrib_type, attrib_normalized, attrib_stride, attrib_pointer);
+    if (!attrib_enabled) {
+        glDisableVertexAttribArray(0);
+    }
+    glBindBuffer(GL_ARRAY_BUFFER, array_buffer);
+    glBindTexture(GL_TEXTURE_2D, texture);
+    glActiveTexture(active_texture);
+    glUseProgram(old_program);
+    if (blend) glEnable(GL_BLEND);
+    if (scissor) glEnable(GL_SCISSOR_TEST);
+    glViewport(viewport[0], viewport[1], viewport[2], viewport[3]);
+    glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
+}
 
 static SceUID cdram_alloc(uint32_t size, uint32_t align, void **ptr) {
     SceKernelAllocMemBlockOpt opt;
@@ -221,16 +404,11 @@ static int lib_init(void) {
     return lib_state;
 }
 
-/* GL thread, at each interaction: the per-player conversion targets. */
+/* GL thread, at each interaction: the shader, ring pixmaps and conversion
+   targets, once. */
 int RPVITA_hwvideo_prepare(void) {
-    if (targets_state == 0 && vita_pixmap_gl_thread() && zc_pool_block(0)) {
-        targets_state = 1;
-        for (int i = 0; i < HW_MAX; i++) {
-            if (zc_make_target(HW_MAX_WIDTH, HW_MAX_HEIGHT, &targets[i], &target_fbos[i], lib_msg, sizeof(lib_msg))) {
-                targets_state = -1;
-                break;
-            }
-        }
+    if (targets_state == 0 && vita_pixmap_gl_thread()) {
+        targets_state = gl_setup() ? -1 : 1;
     }
     return targets_state;
 }
@@ -248,7 +426,7 @@ static void set_ts(SceVideodecTimeStamp *ts, int64_t v) {
 static int free_slot(HwPlayer *p) {
     while (!p->stop) {
         SDL_LockMutex(p->lock);
-        for (int i = 0; i < HW_RING; i++) {
+        for (int i = 0; i < p->slots; i++) {
             if (p->slot_state[i] == SLOT_FREE) {
                 SDL_UnlockMutex(p->lock);
                 return i;
@@ -305,7 +483,7 @@ static int decode_au(HwPlayer *p, AVPacket *pkt) {
         memset(&pic, 0, sizeof(pic));
         pic.size = sizeof(pic);
         pic.frame.pixelType = SCE_AVCDEC_PIXELFORMAT_YUV420_PACKED_RASTER;
-        pic.frame.framePitch = p->coded_w;
+        pic.frame.framePitch = HW_PITCH;
         pic.frame.frameWidth = p->coded_w;
         pic.frame.frameHeight = p->coded_h;
         pic.frame.pPicture[0] = p->slot[s];
@@ -417,14 +595,20 @@ static int demux_thread(void *data) {
     HwPlayer *p = (HwPlayer *) data;
     AVPacket *pkt = av_packet_alloc();
 
-    /* The frame pool is made on the main thread at an interaction. */
-    while (!p->stop && !(p->ring = zc_pool_block(p->index))) {
+    /* The ring pixmaps are made on the main thread at an interaction. */
+    while (!p->stop && targets_state == 0) {
         sceKernelDelayThread(10000);
     }
-    if (p->ring) {
-        uint32_t frame = p->coded_w * p->coded_h * 3 / 2;
+    if (targets_state != 1) {
+        p->failed = 1;
+        snprintf(p->msg, sizeof(p->msg), "no ring: %s", lib_msg);
+        p->stop = 1;
+    } else {
+        p->slots = HW_RING;
         for (int i = 0; i < HW_RING; i++) {
-            p->slot[i] = p->ring->base + i * frame;
+            p->slot_pixmap[i] = &pixmaps[p->index][i / HW_SLOTS_PER_PIXMAP];
+            p->slot_row[i] = (i % HW_SLOTS_PER_PIXMAP) * HW_SLOT_ROWS;
+            p->slot[i] = p->slot_pixmap[i]->base + p->slot_row[i] * HW_PITCH;
         }
     }
 
@@ -689,6 +873,9 @@ int RPVITA_hwvideo_open(const char *path, int loop) {
     p->volume = 32768;
     p->volume_set = -1;
     p->shown = -1;
+    for (int i = 0; i < HW_KEEP; i++) {
+        p->recent[i] = -1;
+    }
     p->loop = loop;
     strncpy(p->path, path, sizeof(p->path) - 1);
     p->used = 1;
@@ -734,7 +921,7 @@ int RPVITA_hwvideo_playing(int handle) {
     }
     SDL_LockMutex(p->lock);
     int ready = 0;
-    for (int i = 0; i < HW_RING; i++) {
+    for (int i = 0; i < p->slots; i++) {
         ready += p->slot_state[i] == SLOT_READY;
     }
     SDL_UnlockMutex(p->lock);
@@ -777,7 +964,7 @@ static int64_t clock_now(HwPlayer *p) {
    height); else None. */
 PyObject *RPVITA_hwvideo_read_texture(int handle) {
     HwPlayer *p = lookup(handle);
-    if (!p || !p->t0 || targets_state != 1 || !p->ring) {
+    if (!p || !p->t0 || targets_state != 1 || !p->slots) {
         Py_RETURN_NONE;
     }
 
@@ -785,20 +972,26 @@ PyObject *RPVITA_hwvideo_read_texture(int handle) {
     int pick = -1;
 
     SDL_LockMutex(p->lock);
-    for (int i = 0; i < HW_RING; i++) {
+    for (int i = 0; i < p->slots; i++) {
         if (p->slot_state[i] == SLOT_READY && p->slot_pts[i] <= now && (pick < 0 || p->slot_pts[i] > p->slot_pts[pick])) {
             pick = i;
         }
     }
     if (pick >= 0) {
-        for (int i = 0; i < HW_RING; i++) {
+        for (int i = 0; i < p->slots; i++) {
             if (i != pick && p->slot_state[i] == SLOT_READY && p->slot_pts[i] < p->slot_pts[pick]) {
                 p->slot_state[i] = SLOT_FREE;
                 p->dropped++;
             }
         }
         if (p->shown >= 0) {
-            p->slot_state[p->shown] = SLOT_FREE;
+            if (p->recent[HW_KEEP - 1] >= 0) {
+                p->slot_state[p->recent[HW_KEEP - 1]] = SLOT_FREE;
+            }
+            for (int i = HW_KEEP - 1; i > 0; i--) {
+                p->recent[i] = p->recent[i - 1];
+            }
+            p->recent[0] = p->shown;
         }
         p->slot_state[pick] = SLOT_SHOWN;
         p->shown = pick;
@@ -811,8 +1004,7 @@ PyObject *RPVITA_hwvideo_read_texture(int handle) {
         Py_RETURN_NONE;
     }
 
-    const uint8_t *y = p->slot[pick];
-    zc_convert_nv12(p->ring, y, y + p->coded_w * p->coded_h, p->coded_w, p->width, p->height, target_fbos[p->index]);
+    hw_convert(p->slot_pixmap[pick], p->slot_row[pick], p->coded_h, p->width, p->height, target_fbos[p->index]);
 
     return Py_BuildValue("(iiiii)", (int) targets[p->index], p->width, p->height, HW_MAX_WIDTH, HW_MAX_HEIGHT);
 }

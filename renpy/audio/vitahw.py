@@ -36,12 +36,16 @@ def prepare():
     (channels start movies from the periodic audio thread).
     """
 
-    if renpy.config.vita_zero_copy_video:
+    if not renpy.config.vita_zero_copy_video:
+        return
+
+    # The port's own player has its own pixmaps and shader; AvPlayer's frame
+    # pool is only made when AvPlayer plays the movies.
+    if hw_available():
+        renpyvita.hwvideo_prepare()
+    else:
         renpyvita.video_set_zero_copy(True)
         renpyvita.video_prepare()
-
-        if hw_available():
-            renpyvita.hwvideo_prepare()
 
 
 class VitaVideoChannel(object):

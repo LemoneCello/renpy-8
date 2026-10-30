@@ -652,8 +652,8 @@ static int zc_setup(int width, int height) {
 
 /* Converts an NV12 frame whose planes are inside pool pixmap block (luma at
  * y, chroma at uv, rows stride bytes apart) into the texture attached to
- * fbo, leaving the GL state as it found it. Also used by vita_hwvideo.c. */
-void zc_convert_nv12(VitaPixmap *block, const uint8_t *y, const uint8_t *uv, int stride, int width, int height, GLuint fbo) {
+ * fbo, leaving the GL state as it found it. */
+static void zc_convert_nv12(VitaPixmap *block, const uint8_t *y, const uint8_t *uv, int stride, int width, int height, GLuint fbo) {
     static const GLfloat quad[] = { -1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f, 1.0f, 1.0f };
 
     GLint program, framebuffer, viewport[4], array_buffer, active_texture, texture;
@@ -710,47 +710,6 @@ void zc_convert_nv12(VitaPixmap *block, const uint8_t *y, const uint8_t *uv, int
 
 static void zc_convert(VitaPixmap *block, uint8_t *data, int width, int height) {
     zc_convert_nv12(block, data, data + width * height, width, width, height, zc_fbo);
-}
-
-/* For vita_hwvideo.c: makes a conversion target (an RGBA texture attached
- * to its own framebuffer); 0 on success. GL thread only. */
-int zc_make_target(int width, int height, GLuint *texture, GLuint *fbo, char *msg, size_t len) {
-    GLint old_framebuffer = 0;
-
-    if (zc_setup(ZC_TARGET_MIN_WIDTH, ZC_TARGET_MIN_HEIGHT)) {
-        snprintf(msg, len, "%s", zero_copy_msg);
-        return -1;
-    }
-
-    glGenTextures(1, texture);
-    glBindTexture(GL_TEXTURE_2D, *texture);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
-    glBindTexture(GL_TEXTURE_2D, 0);
-
-    glGenFramebuffers(1, fbo);
-    glGetIntegerv(GL_FRAMEBUFFER_BINDING, &old_framebuffer);
-    glBindFramebuffer(GL_FRAMEBUFFER, *fbo);
-    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, *texture, 0);
-    GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
-    glBindFramebuffer(GL_FRAMEBUFFER, old_framebuffer);
-
-    if (status != GL_FRAMEBUFFER_COMPLETE) {
-        snprintf(msg, len, "framebuffer status 0x%x", status);
-        return -1;
-    }
-    return 0;
-}
-
-/* For vita_hwvideo.c: frame pool pixmap i, once made (see video_prepare). */
-VitaPixmap *zc_pool_block(int i) {
-    if (frame_pool_state != 1 || i < 0 || i >= FRAME_POOL_SIZE) {
-        return NULL;
-    }
-    return &frame_pool[i];
 }
 
 void RPVITA_video_set_zero_copy(int enabled) {
