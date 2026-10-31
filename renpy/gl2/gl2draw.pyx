@@ -1279,7 +1279,11 @@ cdef class GL2Draw:
         x, y = self.untranslate_point(x, y)
         pygame.mouse.set_pos([x, y])
 
-    def screenshot(self, render_tree):
+    def screenshot(self, render_tree, fullscreen_video=False):
+        # fullscreen_video: Ren'Py 6.99's second argument, still passed by
+        # games written for it (renpy.display.draw.screenshot(None, False));
+        # ignored.
+
         cdef unsigned char *pixels
         cdef SDL_Surface *surf
 

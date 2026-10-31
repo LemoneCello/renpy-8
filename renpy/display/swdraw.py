@@ -796,9 +796,12 @@ class SWDraw(object):
 
         return pygame.mouse.set_pos([x, y])
 
-    def screenshot(self, surftree):
+    def screenshot(self, surftree, fullscreen_video=False):
         """
         Returns a pygame surface containing a screenshot.
+
+        `fullscreen_video` is Ren'Py 6.99's second argument, still passed by
+        games written for it; it's ignored.
         """
 
         return self.window
