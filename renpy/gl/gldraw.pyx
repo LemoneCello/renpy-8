@@ -80,6 +80,9 @@ cdef class GLDraw:
         # The GL render-to-texture to use.
         self.rtt = None
 
+        # Where a render-to-texture lands in the framebuffer (see gldraw.pxd).
+        self.rtt_origin = (0, 0)
+
         # The screen.
         self.window = None
 
@@ -1094,7 +1097,15 @@ cdef class GLDraw:
             else:
                 glClearColor(0.0, 0.0, 0.0, 1.0)
 
-            glClear(GL_COLOR_BUFFER_BIT)
+            # Drawing into part of a bigger texture: clear only that part.
+            ox, oy = self.rtt_origin
+            if ox or oy:
+                glEnable(GL_SCISSOR_TEST)
+                glScissor(ox, oy, w, h)
+                glClear(GL_COLOR_BUFFER_BIT)
+                glDisable(GL_SCISSOR_TEST)
+            else:
+                glClear(GL_COLOR_BUFFER_BIT)
 
             self.default_clip = (0, 0, width, height)
             clip = self.default_clip

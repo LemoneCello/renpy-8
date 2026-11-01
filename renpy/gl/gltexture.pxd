@@ -28,11 +28,13 @@ cdef class TextureCore:
     cdef public int height
     cdef public int generation
     cdef public unsigned int number
-    cdef unsigned int format
-    cdef double xmul
-    cdef double xadd
-    cdef double ymul
-    cdef double yadd
+    # Public so that a render-to-texture can be pointed at part of a
+    # bigger texture (the Vita port's atlas, pipeline rpy/vita_fbo_rtt.rpy).
+    cdef public unsigned int format
+    cdef public double xmul
+    cdef public double xadd
+    cdef public double ymul
+    cdef public double yadd
     cdef object premult
     cdef tuple premult_size
     cdef int premult_left

@@ -54,6 +54,11 @@ cdef class GLDraw:
 
     cdef public tuple clip_rtt_box
 
+    # Where a render-to-texture lands in the framebuffer: (0, 0) normally;
+    # elsewhere when it draws into part of a bigger texture (an atlas). The
+    # caller sets the viewport there; the clear and scissor follow this.
+    cdef public tuple rtt_origin
+
     # The number of drawable pixels per virtual pixel.
     cdef public object draw_per_virt
 

@@ -639,8 +639,11 @@ cdef class ShaderEnviron(Environ):
 
             cx, cy, cw, ch = draw.clip_rtt_box
 
+            # Shifted to where the render-to-texture lands (gldraw.pxd).
+            ox, oy = draw.rtt_origin
+
             glEnable(GL_SCISSOR_TEST)
-            glScissor(<GLint> round(minx - cx), <GLint> round(miny - cy), <GLint> round(maxx - minx), <GLint> round(maxy - miny))
+            glScissor(<GLint> round(minx - cx + ox), <GLint> round(miny - cy + oy), <GLint> round(maxx - minx), <GLint> round(maxy - miny))
 
         if self.program is not None:
             self.program.disable_attribs()
