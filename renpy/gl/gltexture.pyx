@@ -1432,6 +1432,26 @@ def load_premultiplied(data, width, height, update, rtt):
             type,
             <GLubyte *> pixels)
 
+# The texture number watch_sampling() watches, and whether a draw has
+# sampled it since: lets the Vita's render-to-texture atlas notice a draw
+# into the atlas that reads from the atlas (undefined in GL), and redo it
+# elsewhere.
+cdef unsigned int watched_number = 0
+cdef bint watched_hit = False
+
+def watch_sampling(unsigned int number):
+    """
+    Starts watching for draws that sample the texture `number` (0 stops
+    watching). Returns whether the watch before this one saw any.
+    """
+
+    global watched_number, watched_hit
+
+    rv = watched_hit
+    watched_number = number
+    watched_hit = False
+    return rv
+
 cdef void draw_rectangle(
     Environ environ,
     double sx,
@@ -1468,6 +1488,8 @@ cdef void draw_rectangle(
     `toff_...`
         Texture offset to apply to the given side of the texture.
     """
+
+    global watched_hit
 
     # Do we have the given texture?
     cdef int has_tex0, has_tex1, has_tex2
@@ -1506,6 +1528,9 @@ cdef void draw_rectangle(
         glActiveTexture(GL_TEXTURE0)
         glBindTexture(GL_TEXTURE_2D, tex0.number)
 
+        if watched_number and tex0.number == watched_number:
+            watched_hit = True
+
         xadd = tex0.xadd
         yadd = tex0.yadd
         xmul = tex0.xmul
@@ -1526,6 +1551,9 @@ cdef void draw_rectangle(
         glActiveTexture(GL_TEXTURE1)
         glBindTexture(GL_TEXTURE_2D, tex1.number)
 
+        if watched_number and tex1.number == watched_number:
+            watched_hit = True
+
         xadd = tex1.xadd
         yadd = tex1.yadd
         xmul = tex1.xmul
@@ -1545,6 +1573,9 @@ cdef void draw_rectangle(
 
         glActiveTexture(GL_TEXTURE2)
         glBindTexture(GL_TEXTURE_2D, tex2.number)
+
+        if watched_number and tex2.number == watched_number:
+            watched_hit = True
 
         xadd = tex2.xadd
         yadd = tex2.yadd
