@@ -1198,6 +1198,12 @@ cdef class Render:
         self.cached_texture = None
         self.cached_model = None
 
+        # Pixellate's halved copies (GLDraw.get_half): on the Vita's legacy
+        # renderer the first is a screen-sized render target, of which there
+        # are only a few; a killed Render that's still referenced held on
+        # to one, and a later image dissolve fell back to slow copies.
+        self.half_cache = None
+
 
     def add_focus(self, d, arg=None, x=0, y=0, w=None, h=None, mx=None, my=None, mask=None):
         """
