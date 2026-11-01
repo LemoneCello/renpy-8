@@ -546,13 +546,16 @@ FLATTEN = 4
 
 cdef class Render:
 
-    def __init__(Render self, float width, float height, layer_name=None): #@DuplicatedSignature
+    def __init__(Render self, float width, float height, layer_name=None, opaque=None): #@DuplicatedSignature
         """
         Creates a new render corresponding to the given widget with
         the specified width and height.
 
         If `layer_name` is given, then this render corresponds to a
         layer.
+
+        `opaque` was a hint in Ren'Py 6.99, still passed by games written
+        for it (renpy.Render(w, h, opaque=False)); it's ignored.
         """
 
         # The mark bit, used for mark/sweep-style garbage collection of
