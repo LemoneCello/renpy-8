@@ -59,6 +59,11 @@ cdef class GLDraw:
     # caller sets the viewport there; the clear and scissor follow this.
     cdef public tuple rtt_origin
 
+    # What get_half cached its halves on, in the frame being drawn and the
+    # one before (draw_screen drops the older ones' caches).
+    cdef list half_now
+    cdef list half_last
+
     # The number of drawable pixels per virtual pixel.
     cdef public object draw_per_virt
 

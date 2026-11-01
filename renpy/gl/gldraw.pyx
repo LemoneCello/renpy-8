@@ -83,6 +83,9 @@ cdef class GLDraw:
         # Where a render-to-texture lands in the framebuffer (see gldraw.pxd).
         self.rtt_origin = (0, 0)
 
+        self.half_now = [ ]
+        self.half_last = [ ]
+
         # The screen.
         self.window = None
 
@@ -746,6 +749,19 @@ cdef class GLDraw:
 
         renpy.plog(1, "start draw_screen")
 
+        # Pixellate's halves (get_half) are only needed while it draws: drop
+        # the ones the last frame didn't use. Otherwise they stay as long as
+        # what they halve, and on the Vita the first, screen-sized, holds
+        # one of the few render targets (an image dissolve after two
+        # Pixellates fell back to ~2 fps copies).
+        if self.half_last:
+            used = set(id(i) for i in self.half_now)
+            for i in self.half_last:
+                if id(i) not in used:
+                    i.half_cache = None
+        self.half_last = self.half_now
+        self.half_now = [ ]
+
         if renpy.config.use_drawable_resolution:
             reverse = self.virt_to_draw
         else:
@@ -1171,6 +1187,8 @@ cdef class GLDraw:
         # Used to work around a bug in cython where self was not getting
         # the right type when being assigned to the closure.
         cdef GLDraw draw = self
+
+        self.half_now.append(what)
 
         if what.half_cache:
             return what.half_cache
