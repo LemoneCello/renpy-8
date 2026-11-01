@@ -192,6 +192,11 @@ void main()
 }
 """
 
+# Movie(side_mask=True) on the Vita's zero-copy frames: TEXTURE0 is the
+# picture, TEXTURE1 the mask beside it in the same frame (its red as alpha).
+SIDEMASK_SHADER = BLEND_SHADER.replace("mix(color0, color1, done)", "color0 * color1.r")
+SIDEMASK_CLIP_SHADER = BLEND_CLIP_SHADER.replace("mix(color0, color1, done)", "color0 * color1.r")
+
 IMAGEBLEND_SHADER = GLES_PORTABILITY + """\
 uniform vec4 Color;
 uniform sampler2D tex0;
@@ -407,10 +412,12 @@ cdef class ShaderEnviron(Environ):
     cdef Program blit_program
     cdef Program blend_program
     cdef Program imageblend_program
+    cdef Program sidemask_program
 
     cdef Program blit_clip_program
     cdef Program blend_clip_program
     cdef Program imageblend_clip_program
+    cdef Program sidemask_clip_program
 
     cdef bint clipping
     cdef double clip_x0
@@ -435,6 +442,9 @@ cdef class ShaderEnviron(Environ):
         self.imageblend_program = Program(VERTEX_SHADER3, IMAGEBLEND_SHADER)
         self.imageblend_clip_program = Program(VERTEX_SHADER3, IMAGEBLEND_CLIP_SHADER)
 
+        self.sidemask_program = Program(VERTEX_SHADER2, SIDEMASK_SHADER)
+        self.sidemask_clip_program = Program(VERTEX_SHADER2, SIDEMASK_CLIP_SHADER)
+
         # The current program.
         self.program = None
 
@@ -450,6 +460,7 @@ cdef class ShaderEnviron(Environ):
         self.blit_program.delete()
         self.blend_program.delete()
         self.imageblend_program.delete()
+        self.sidemask_program.delete()
 
     def activate(self, Program program):
 
@@ -514,6 +525,18 @@ cdef class ShaderEnviron(Environ):
         # Setup the multiplier and the offset.
         glUniform1f(program.multiplier, 256.0 / ramp)
         glUniform1f(program.offset, offset)
+
+    cdef void sidemask(self):
+
+        if self.clipping:
+            program = self.sidemask_clip_program
+        else:
+            program = self.sidemask_program
+
+        if self.program is not program:
+            self.activate(program)
+            glUniform1i(program.tex0, 0)
+            glUniform1i(program.tex1, 1)
 
     cdef void set_vertex(self, float *vertices):
         glEnableVertexAttribArray(self.program.Vertex)

@@ -283,13 +283,18 @@ def get_movie_texture(channel, mask_channel=None, side_mask=False, mipmap=None):
     c = renpy.audio.music.get_channel(channel)
 
     # The Vita's zero-copy movies are converted to a texture on the GPU
-    # (renpy.audio.vitahw); masks aren't applied to them.
+    # (renpy.audio.vitahw); mask_channel isn't applied to them, side_mask is
+    # by a shader (legacy gl renderer only: gl2 shows both halves).
     read_video_texture = getattr(c, "read_video_texture", None)
 
     if read_video_texture is not None and c.zero_copy():
         tex = read_video_texture()
 
         if tex is not None:
+            if side_mask and hasattr(tex, "mask"):
+                import renpy.gl.gltexture as gltexture
+                tex = gltexture.side_mask_grid(tex)
+
             texture[channel] = tex
             frame_serial[channel] += 1
             return tex, True

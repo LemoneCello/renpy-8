@@ -923,6 +923,34 @@ def texture_grid_from_number(unsigned int number, int width, int height, int tex
     return rv
 
 
+def side_mask_grid(TextureGrid tg):
+    """
+    For a one-tile `tg` holding a movie frame with its mask in the right
+    half (Movie(side_mask=True)): a TextureGrid of the left half that blit
+    draws with the right half's red channel as alpha. Shares tg's GL texture,
+    so it suits the Vita's zero-copy frames, which aren't masked on the CPU.
+    """
+
+    cdef TextureCore t = tg.tiles[0][0]
+    cdef int w = tg.width // 2
+
+    cdef TextureCore m = TextureCore(w, tg.height)
+    m.number = t.number
+    m.format = t.format
+    m.xadd = t.xadd + w * t.xmul
+    m.yadd = t.yadd
+    m.xmul = t.xmul
+    m.ymul = t.ymul
+
+    rv = TextureGrid(w, tg.height)
+    rv.columns = [ (0, w, 0) ]
+    rv.rows = tg.rows
+    rv.tiles = tg.tiles
+    rv.mask = m
+
+    return rv
+
+
 def texture_grid_from_surface(surf, transient, properties):
     """
     This takes a Surface and turns it into a TextureGrid.
@@ -1077,7 +1105,11 @@ cpdef blit(TextureGrid tg, double sx, double sy, Matrix transform, double alpha,
 
     tg.make_ready(nearest)
 
-    environ.blit()
+    if tg.mask is not None:
+        environ.sidemask()
+    else:
+        environ.blit()
+
     environ.set_color(alpha, alpha, alpha, over * alpha)
 
     y = 0
@@ -1096,7 +1128,7 @@ cpdef blit(TextureGrid tg, double sx, double sy, Matrix transform, double alpha,
                 texw, texh,
                 transform,
                 tex, texx, texy,
-                None, 0, 0,
+                tg.mask, texx, texy,
                 None, 0, 0,
                 )
 

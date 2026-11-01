@@ -62,6 +62,7 @@ cdef class TextureGrid:
     cdef list columns
     cdef list tiles # list of lists.
     cdef public TextureGrid half_cache
+    cdef public TextureCore mask
 
     cpdef void make_ready(self, bint nearest)
 

@@ -96,6 +96,7 @@ cdef class Environ:
     cdef void blit(self)
     cdef void blend(self, double fraction)
     cdef void imageblend(self, double fraction, int ramp)
+    cdef void sidemask(self)
     cdef void set_vertex(self, float *vertices)
     cdef void set_texture(self, int unit, float *coords)
     cdef void set_color(self, float r, float g, float b, float a)

@@ -1401,6 +1401,12 @@ cdef class Environ(object):
         `ramp` is the length of the ramp.
         """
 
+    cdef void sidemask(self):
+        """
+        Set up an environment that draws TEXTURE0 with TEXTURE1's red
+        channel as its alpha.
+        """
+
     cdef void set_vertex(self, float *vertices):
         """
         Sets the array of vertices to be shown. Vertices should be an packed
